@@ -1,112 +1,35 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-
-# Virtual Environments
-venv/
-venv_build/
-env/
-ENV/
-env.bak/
-venv.bak/
-
-# PyInstaller
-build/
-dist/
-*.spec.bak
-*.manifest
-*.spec~
-
-# Installer Output
-installer_output/
-
-# Distribution / packaging
-.Python
-develop-eggs/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# IDE / Editor
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.project
-.pydevproject
-.settings/
-*.sublime-project
-*.sublime-workspace
-
-# OS Files
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-desktop.ini
-
-# Logs and databases
+# Logs
+logs
 *.log
-*.sql
-*.sqlite
-*.db
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-cover/
+node_modules
+dist
+dist-ssr
+*.local
 
-# Jupyter Notebook
-.ipynb_checkpoints
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
 
-# pyenv
-.python-version
+# Tauri
+src-tauri/target
 
-# Environment variables
-.env
-.env.local
-.venv
-pip-log.txt
-pip-delete-this-directory.txt
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
+# Python archive (legacy code for reference)
+python-archive/build/
+python-archive/dist/
+python-archive/installer_output/
+python-archive/venv_build/
+python-archive/**/__pycache__/
+python-archive/**/*.pyc

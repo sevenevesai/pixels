@@ -1,0 +1,37 @@
+[package]
+name = "pixels-toolkit"
+version = "1.0.0"
+description = "Image processing and sprite sheet packing tool for pixel art"
+authors = ["SeveNeves"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "tauri_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+image = "0.25"
+imageproc = "0.25"
+ndarray = "0.16"
+rustfft = "6"
+rayon = "1.10"
+thiserror = "2"
+anyhow = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+palette = "0.7"
+
