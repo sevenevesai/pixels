@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { readDir, exists } from "@tauri-apps/plugin-fs";
+import { readDir, exists, readFile } from "@tauri-apps/plugin-fs";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { join, sep } from "@tauri-apps/api/path";
 import "./App.css";
@@ -16,6 +16,7 @@ interface ImageFile {
   name: string;
   path: string;
   selected: boolean;
+  thumbnail?: string; // base64 data URL
 }
 
 type TabType = "downscale" | "process" | "pack";
