@@ -1,0 +1,5 @@
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+
+pyinstaller --clean sprite_toolkit.spec
+
+.\venv_build\Scripts\Activate.ps1
