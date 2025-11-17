@@ -1,7 +1,7 @@
 mod error;
 mod packer;
 mod processor;
-mod downscaler;
+pub mod downscaler;
 mod db;
 
 use std::path::PathBuf;

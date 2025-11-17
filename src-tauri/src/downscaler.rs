@@ -2,7 +2,6 @@ use image::{RgbaImage, Rgba, ImageBuffer};
 use rustfft::{FftPlanner, num_complex::Complex};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::collections::VecDeque;
 use crate::error::{Result, PixelsError};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,12 +95,14 @@ fn detect_grid_size(img: &RgbaImage) -> Option<f32> {
     let v_period = fft_detect_period(&v_profile, 6.0, 20.0);
 
     // Return average if both detected
-    match (h_period, v_period) {
+    let result = match (h_period, v_period) {
         (Some(h), Some(v)) => Some((h + v) / 2.0),
         (Some(h), None) => Some(h),
         (None, Some(v)) => Some(v),
         (None, None) => None,
-    }
+    };
+
+    result
 }
 
 /// Detect period using FFT
@@ -151,7 +152,137 @@ fn fft_detect_period(signal: &[f32], min_period: f32, max_period: f32) -> Option
     }
 }
 
-/// Remove background using flood fill
+/// Public wrapper for testing
+pub fn remove_background_public(img: &mut RgbaImage, settings: &DownscalerSettings) {
+    remove_background(img, settings);
+}
+
+/// Sample RGB colors from canvas edges (Python's approach)
+fn sample_edge_colors(img: &RgbaImage, sample_width: u32) -> Vec<[u8; 3]> {
+    let (width, height) = img.dimensions();
+    let mut colors = Vec::new();
+
+    // Top edge
+    for y in 0..sample_width.min(height) {
+        for x in 0..width {
+            let pixel = img.get_pixel(x, y);
+            colors.push([pixel[0], pixel[1], pixel[2]]);
+        }
+    }
+
+    // Bottom edge
+    for y in (height.saturating_sub(sample_width))..height {
+        for x in 0..width {
+            let pixel = img.get_pixel(x, y);
+            colors.push([pixel[0], pixel[1], pixel[2]]);
+        }
+    }
+
+    // Left edge
+    for y in 0..height {
+        for x in 0..sample_width.min(width) {
+            let pixel = img.get_pixel(x, y);
+            colors.push([pixel[0], pixel[1], pixel[2]]);
+        }
+    }
+
+    // Right edge
+    for y in 0..height {
+        for x in (width.saturating_sub(sample_width))..width {
+            let pixel = img.get_pixel(x, y);
+            colors.push([pixel[0], pixel[1], pixel[2]]);
+        }
+    }
+
+    colors
+}
+
+/// Find most common background colors (Python's approach)
+fn find_background_colors(edge_colors: &[[u8; 3]], max_colors: usize) -> Vec<[u8; 3]> {
+    use std::collections::HashMap;
+
+    // Round to nearest 16 (like Python)
+    let mut color_counts: HashMap<[u8; 3], usize> = HashMap::new();
+    for color in edge_colors {
+        let rounded = [
+            (color[0] / 16) * 16,
+            (color[1] / 16) * 16,
+            (color[2] / 16) * 16,
+        ];
+        *color_counts.entry(rounded).or_insert(0) += 1;
+    }
+
+    // Get top N colors
+    let mut counts: Vec<_> = color_counts.into_iter().collect();
+    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts.into_iter().take(max_colors).map(|(c, _)| c).collect()
+}
+
+/// RGB color distance (Python uses sum of absolute differences)
+fn rgb_color_distance(c1: &[u8; 3], c2: &[u8; 3]) -> i32 {
+    (c1[0] as i32 - c2[0] as i32).abs() +
+    (c1[1] as i32 - c2[1] as i32).abs() +
+    (c1[2] as i32 - c2[2] as i32).abs()
+}
+
+/// Check if edge pixel is likely content (Python's is_content_edge)
+fn is_content_edge(img: &RgbaImage, x: u32, y: u32, window_size: u32) -> bool {
+    let (width, height) = img.dimensions();
+
+    let x_start = x.saturating_sub(window_size);
+    let x_end = (x + window_size + 1).min(width);
+    let y_start = y.saturating_sub(window_size);
+    let y_end = (y + window_size + 1).min(height);
+
+    // Calculate variance and color range in neighborhood
+    let mut rgb_values: Vec<[u8; 3]> = Vec::new();
+    for ny in y_start..y_end {
+        for nx in x_start..x_end {
+            let pixel = img.get_pixel(nx, ny);
+            rgb_values.push([pixel[0], pixel[1], pixel[2]]);
+        }
+    }
+
+    if rgb_values.is_empty() {
+        return false;
+    }
+
+    // Calculate variance
+    let mean: [f32; 3] = [
+        rgb_values.iter().map(|p| p[0] as f32).sum::<f32>() / rgb_values.len() as f32,
+        rgb_values.iter().map(|p| p[1] as f32).sum::<f32>() / rgb_values.len() as f32,
+        rgb_values.iter().map(|p| p[2] as f32).sum::<f32>() / rgb_values.len() as f32,
+    ];
+
+    let variance: f32 = rgb_values.iter().map(|p| {
+        let diff = [
+            p[0] as f32 - mean[0],
+            p[1] as f32 - mean[1],
+            p[2] as f32 - mean[2],
+        ];
+        diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2]
+    }).sum::<f32>() / rgb_values.len() as f32;
+
+    // Calculate color range (ptp = peak-to-peak = max - min)
+    let min_vals = [
+        rgb_values.iter().map(|p| p[0]).min().unwrap(),
+        rgb_values.iter().map(|p| p[1]).min().unwrap(),
+        rgb_values.iter().map(|p| p[2]).min().unwrap(),
+    ];
+    let max_vals = [
+        rgb_values.iter().map(|p| p[0]).max().unwrap(),
+        rgb_values.iter().map(|p| p[1]).max().unwrap(),
+        rgb_values.iter().map(|p| p[2]).max().unwrap(),
+    ];
+    let color_range = (max_vals[0] - min_vals[0]) as i32 +
+                      (max_vals[1] - min_vals[1]) as i32 +
+                      (max_vals[2] - min_vals[2]) as i32;
+
+    // Python's thresholds: variance > 100 or color_range > 50
+    variance > 100.0 || color_range > 50
+}
+
+/// Remove background using Python's algorithm
 fn remove_background(img: &mut RgbaImage, settings: &DownscalerSettings) {
     if matches!(settings.bg_removal_mode, BgRemovalMode::None) {
         return;
@@ -161,86 +292,165 @@ fn remove_background(img: &mut RgbaImage, settings: &DownscalerSettings) {
     let tolerance = settings.bg_tolerance as i32;
     let edge_tolerance = settings.bg_edge_tolerance as i32;
 
-    // Sample edge colors to determine background
-    let mut edge_colors: Vec<Rgba<u8>> = Vec::new();
+    // Sample RGB colors from canvas edges (Python line 178)
+    let edge_colors = sample_edge_colors(img, 5);
 
-    // Top and bottom edges
-    for x in 0..width {
-        edge_colors.push(*img.get_pixel(x, 0));
-        edge_colors.push(*img.get_pixel(x, height - 1));
+    // Find background colors (Python line 179)
+    let bg_colors = find_background_colors(&edge_colors, 3);
+
+    if bg_colors.is_empty() {
+        return;
     }
 
-    // Left and right edges
-    for y in 0..height {
-        edge_colors.push(*img.get_pixel(0, y));
-        edge_colors.push(*img.get_pixel(width - 1, y));
-    }
-
-    // Find most common edge color
-    let bg_color = edge_colors.iter()
-        .max_by_key(|c| {
-            edge_colors.iter().filter(|&x| color_distance(c, x) < edge_tolerance).count()
-        })
-        .copied()
-        .unwrap_or(Rgba([255, 255, 255, 255]));
-
-    // Flood fill from edges
-    let mut visited = vec![vec![false; width as usize]; height as usize];
-    let mut queue = VecDeque::new();
-
-    // Add all edge pixels that match background color
-    for x in 0..width {
-        for y in &[0, height - 1] {
-            if color_distance(&bg_color, img.get_pixel(x, *y)) < tolerance {
-                queue.push_back((x, *y));
-            }
-        }
-    }
-    for y in 0..height {
-        for x in &[0, width - 1] {
-            if color_distance(&bg_color, img.get_pixel(*x, y)) < tolerance {
-                queue.push_back((*x, y));
-            }
-        }
-    }
-
-    // Flood fill
-    while let Some((x, y)) = queue.pop_front() {
-        if visited[y as usize][x as usize] {
-            continue;
-        }
-
-        visited[y as usize][x as usize] = true;
-
-        let pixel = img.get_pixel(x, y);
-
-        // Check if should preserve (dark lines)
-        if settings.preserve_dark_lines {
-            let sum = pixel[0] as u16 + pixel[1] as u16 + pixel[2] as u16;
-            if sum < settings.dark_line_threshold {
-                continue;
-            }
-        }
-
-        // Make transparent
-        img.put_pixel(x, y, Rgba([pixel[0], pixel[1], pixel[2], 0]));
-
-        // Add neighbors
-        let neighbors = [(0, -1), (0, 1), (-1, 0), (1, 0)];
-        for (dx, dy) in neighbors {
-            let nx = x as i32 + dx;
-            let ny = y as i32 + dy;
-
-            if nx >= 0 && nx < width as i32 && ny >= 0 && ny < height as i32 {
-                let nx = nx as u32;
-                let ny = ny as u32;
-
-                if !visited[ny as usize][nx as usize] {
-                    let npixel = img.get_pixel(nx, ny);
-                    if color_distance(&bg_color, &npixel) < tolerance {
-                        queue.push_back((nx, ny));
+    // Detect content edges in conservative mode (Python lines 161-170)
+    let mut content_edge_mask = vec![vec![false; width as usize]; height as usize];
+    if matches!(settings.bg_removal_mode, BgRemovalMode::Conservative) {
+        let edge_width = 10u32;
+        for y in 0..height {
+            for x in 0..width {
+                if x < edge_width || x >= width - edge_width ||
+                   y < edge_width || y >= height - edge_width {
+                    if is_content_edge(img, x, y, 3) {
+                        content_edge_mask[y as usize][x as usize] = true;
                     }
                 }
+            }
+        }
+    }
+
+    // Create background mask (Python lines 182-193)
+    // Pixels matching background colors, with different tolerance for edges vs interior
+    let mut mask = vec![vec![false; width as usize]; height as usize];
+    let edge_zone = 10u32; // 10-pixel border for higher tolerance
+
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = img.get_pixel(x, y);
+            let rgb = [pixel[0], pixel[1], pixel[2]];
+
+            // Check if in edge zone
+            let in_edge_zone = x < edge_zone || x >= width - edge_zone ||
+                               y < edge_zone || y >= height - edge_zone;
+
+            let threshold = if in_edge_zone { edge_tolerance } else { tolerance };
+
+            // Check if matches any background color
+            for bg_color in &bg_colors {
+                if rgb_color_distance(&rgb, bg_color) <= threshold {
+                    mask[y as usize][x as usize] = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Protect content edges (Python line 199)
+    if matches!(settings.bg_removal_mode, BgRemovalMode::Conservative) {
+        for y in 0..height {
+            for x in 0..width {
+                if content_edge_mask[y as usize][x as usize] {
+                    mask[y as usize][x as usize] = false;
+                }
+            }
+        }
+    }
+
+    // Binary dilation of mask (Python line 209)
+    // In conservative mode: 1 iteration, otherwise 2
+    let dilation_iterations = if matches!(settings.bg_removal_mode, BgRemovalMode::Conservative) { 1 } else { 2 };
+    let mut mask_dilated = mask.clone();
+    for _ in 0..dilation_iterations {
+        let mut new_mask = mask_dilated.clone();
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                if mask_dilated[y][x] {
+                    // Dilate to 4-connected neighbors
+                    if y > 0 { new_mask[y - 1][x] = true; }
+                    if y < height as usize - 1 { new_mask[y + 1][x] = true; }
+                    if x > 0 { new_mask[y][x - 1] = true; }
+                    if x < width as usize - 1 { new_mask[y][x + 1] = true; }
+                }
+            }
+        }
+        mask_dilated = new_mask;
+    }
+
+    // Create edge seed from canvas edges that are in dilated mask (Python lines 202-206)
+    let mut edge_seed = vec![vec![false; width as usize]; height as usize];
+    for x in 0..width as usize {
+        if mask_dilated[0][x] {
+            edge_seed[0][x] = true;
+        }
+        if mask_dilated[height as usize - 1][x] {
+            edge_seed[height as usize - 1][x] = true;
+        }
+    }
+    for y in 0..height as usize {
+        if mask_dilated[y][0] {
+            edge_seed[y][0] = true;
+        }
+        if mask_dilated[y][width as usize - 1] {
+            edge_seed[y][width as usize - 1] = true;
+        }
+    }
+
+    // Conservative flood fill (Python lines 211-214, function at 106-120)
+    // Iteratively dilate the result while staying within mask and avoiding barriers
+    let mut flooded = edge_seed.clone();
+    let max_iterations = 500;
+
+    for _iteration in 0..max_iterations {
+        let mut new_flooded = flooded.clone();
+        let mut changed = false;
+
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                if flooded[y][x] {
+                    // Dilate to 4-connected neighbors
+                    let neighbors = [(0i32, -1i32), (0i32, 1i32), (-1i32, 0i32), (1i32, 0i32)];
+                    for (dx, dy) in neighbors {
+                        let nx = x as i32 + dx;
+                        let ny = y as i32 + dy;
+
+                        if nx >= 0 && nx < width as i32 && ny >= 0 && ny < height as i32 {
+                            let nx = nx as usize;
+                            let ny = ny as usize;
+
+                            // Only grow into pixels in dilated mask and not already flooded
+                            // (content_barrier would go here, but it's empty for greenhouse)
+                            if mask_dilated[ny][nx] && !flooded[ny][nx] {
+                                new_flooded[ny][nx] = true;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !changed {
+            break;
+        }
+
+        flooded = new_flooded;
+    }
+
+    // Apply the flood fill result: make flooded pixels transparent (Python line 218)
+    for y in 0..height {
+        for x in 0..width {
+            if flooded[y as usize][x as usize] {
+                let pixel = img.get_pixel(x, y);
+
+                // Check if should preserve (dark lines)
+                if settings.preserve_dark_lines {
+                    let sum = pixel[0] as u16 + pixel[1] as u16 + pixel[2] as u16;
+                    if sum < settings.dark_line_threshold {
+                        continue;
+                    }
+                }
+
+                // Make transparent
+                img.put_pixel(x, y, Rgba([pixel[0], pixel[1], pixel[2], 0]));
             }
         }
     }
@@ -397,124 +607,99 @@ fn grid_alignment_score(img: &RgbaImage, scale: f32) -> f32 {
     rgb_error + 0.5 * alpha_error + semi_ratio * 100.0
 }
 
-/// Find optimal scale factor using Python's combined scoring
-fn find_optimal_scale(img: &RgbaImage, min_scale: f32, max_scale: f32) -> f32 {
-    #[derive(Debug)]
-    struct ScaleResult {
-        scale: f32,
-        alignment_score: f32,
-        info_content: f32,
-        combined_score: f32,
-    }
-
-    let mut results = Vec::new();
-
-    // Test integer scales in range (Python uses 6-20)
-    for scale_int in (min_scale.ceil() as u32)..=(max_scale.floor() as u32) {
-        let scale = scale_int as f32;
-        let alignment_score = grid_alignment_score(img, scale);
-
-        // Downscale to get information content
-        let (width, height) = img.dimensions();
-        let new_width = (width as f32 / scale).round() as u32;
-        let new_height = (height as f32 / scale).round() as u32;
-
-        if new_width == 0 || new_height == 0 {
-            continue;
+/// Find optimal scale factor using combined scoring (Python's approach)
+fn find_optimal_scale(img: &RgbaImage, min_scale: f32, max_scale: f32, grid_size: Option<f32>) -> f32 {
+    // Narrow search range based on grid_size (Python lines 4-10)
+    let (search_min, search_max) = if let Some(grid) = grid_size {
+        if grid >= min_scale && grid <= max_scale {
+            let narrowed_min = min_scale.max((grid - 2.0).floor());
+            let narrowed_max = max_scale.min((grid + 2.0).ceil());
+            (narrowed_min, narrowed_max)
+        } else {
+            (min_scale, max_scale)
         }
-
-        let downscaled = image::imageops::resize(
-            img,
-            new_width,
-            new_height,
-            image::imageops::FilterType::Nearest,
-        );
-
-        let info_content = information_content(&downscaled);
-
-        // KEY: Combined score subtracts info (favors detail preservation)
-        let combined_score = alignment_score - info_content / 1000.0;
-
-        results.push(ScaleResult {
-            scale,
-            alignment_score,
-            info_content,
-            combined_score,
-        });
-    }
-
-    if results.is_empty() {
-        return min_scale;
-    }
-
-    // Find best combined score
-    let best = results.iter()
-        .min_by(|a, b| a.combined_score.partial_cmp(&b.combined_score).unwrap())
-        .unwrap();
-
-    // Python logic: Check if grid-aligned scale is within 20% of best
-    // If grid size is close to an integer, prefer that
-    let grid_aligned_scale = min_scale.round();
-    if let Some(grid_result) = results.iter().find(|r| r.scale == grid_aligned_scale) {
-        if grid_result.combined_score <= best.combined_score * 1.2 {
-            return grid_aligned_scale;
-        }
-    }
-
-    best.scale
-}
-
-/// Fine-tune scale with fractional values using combined scoring
-fn fine_tune_scale(img: &RgbaImage, base_scale: f32) -> f32 {
-    let mut best_scale = base_scale;
-
-    // Calculate initial combined score
-    let (width, height) = img.dimensions();
-    let mut best_score = {
-        let alignment_score = grid_alignment_score(img, best_scale);
-        let new_width = (width as f32 / best_scale).round() as u32;
-        let new_height = (height as f32 / best_scale).round() as u32;
-
-        if new_width == 0 || new_height == 0 {
-            return best_scale;
-        }
-
-        let downscaled = image::imageops::resize(
-            img,
-            new_width,
-            new_height,
-            image::imageops::FilterType::Nearest,
-        );
-        let info_content = information_content(&downscaled);
-        alignment_score - info_content / 1000.0
+    } else {
+        (min_scale, max_scale)
     };
 
-    // Test fractional scales around base with 0.1 steps
-    for offset in -10..=10 {
-        let scale = base_scale + (offset as f32 * 0.1);
+    let mut best_scale = search_min;
+    let mut best_combined_score = f32::MAX;
+    let mut closest_to_grid: Option<(f32, f32)> = None; // (scale, combined_score)
+
+    for scale_int in (search_min.ceil() as u32)..=(search_max.floor() as u32) {
+        let scale = scale_int as f32;
+
+        // Calculate alignment score
+        let alignment_score = grid_alignment_score(img, scale);
+
+        // Calculate information content
+        let new_width = (img.width() as f32 / scale).round() as u32;
+        let new_height = (img.height() as f32 / scale).round() as u32;
+        let downscaled = image::imageops::resize(
+            img, new_width, new_height,
+            image::imageops::FilterType::Nearest,
+        );
+        let info = information_content(&downscaled);
+
+        // Combined score (Python line 20)
+        let combined_score = alignment_score - info / 1000.0;
+
+        // Track best by combined score
+        if combined_score < best_combined_score {
+            best_combined_score = combined_score;
+            best_scale = scale;
+        }
+
+        // Track closest to grid (Python lines 37-40)
+        if let Some(grid) = grid_size {
+            let distance = (scale - grid).abs();
+            if let Some((prev_scale, _)) = closest_to_grid {
+                let prev_distance = (prev_scale - grid).abs();
+                if distance < prev_distance {
+                    closest_to_grid = Some((scale, combined_score));
+                }
+            } else {
+                closest_to_grid = Some((scale, combined_score));
+            }
+        }
+    }
+
+    // Python's special logic: if grid was detected and closest-to-grid is within 20% of best, use it
+    if grid_size.is_some() {
+        if let Some((closest_scale, closest_score)) = closest_to_grid {
+            if closest_score < best_combined_score * 1.2 {
+                best_scale = closest_scale;
+            }
+        }
+    }
+
+    best_scale
+}
+
+/// Fine-tune scale with fractional values - Python uses ONLY alignment score here
+/// Centers search around grid_size if provided, otherwise around base_scale
+fn fine_tune_scale(img: &RgbaImage, base_scale: f32, grid_size: Option<f32>) -> f32 {
+    // Python centers around grid_size if provided
+    let center = grid_size.unwrap_or(base_scale);
+
+    let mut best_scale = center;  // Initialize to center, not base
+    let mut best_score = grid_alignment_score(img, center);
+
+    // Test fractional scales around center with 0.05 steps (Python uses 0.05)
+    // Search range: center ± 1.0
+    let steps = 40; // 2.0 range / 0.05 step = 40 steps
+
+    for i in -steps..=steps {
+        let scale = center + (i as f32 * 0.05);
         if scale < 1.0 {
             continue;
         }
 
-        let alignment_score = grid_alignment_score(img, scale);
-        let new_width = (width as f32 / scale).round() as u32;
-        let new_height = (height as f32 / scale).round() as u32;
+        let score = grid_alignment_score(img, scale);
 
-        if new_width == 0 || new_height == 0 {
-            continue;
-        }
-
-        let downscaled = image::imageops::resize(
-            img,
-            new_width,
-            new_height,
-            image::imageops::FilterType::Nearest,
-        );
-        let info_content = information_content(&downscaled);
-        let combined_score = alignment_score - info_content / 1000.0;
-
-        if combined_score < best_score {
-            best_score = combined_score;
+        // Python deduplicates by output size - we just track best score
+        if score < best_score {
+            best_score = score;
             best_scale = scale;
         }
     }
@@ -595,12 +780,12 @@ pub fn downscale_image(
     let detected_scale = detect_grid_size(&rgba);
 
     let scale = if detected_scale.is_some() {
-        // Python uses fixed range 6-20 for comprehensive search
-        let base_scale = find_optimal_scale(&rgba, 6.0, 20.0);
+        // Python uses fixed range 6-20 for comprehensive search, but narrows based on grid
+        let base_scale = find_optimal_scale(&rgba, 6.0, 20.0, detected_scale);
 
-        // Fine-tune if enabled
+        // Fine-tune if enabled (Python centers around detected_scale, not base_scale!)
         if settings.enable_fine_tune {
-            fine_tune_scale(&rgba, base_scale)
+            fine_tune_scale(&rgba, base_scale, detected_scale)
         } else {
             base_scale
         }
