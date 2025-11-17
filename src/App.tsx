@@ -2,8 +2,6 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readDir, exists, readFile } from "@tauri-apps/plugin-fs";
-import { convertFileSrc } from "@tauri-apps/api/core";
-import { join, sep } from "@tauri-apps/api/path";
 import "./App.css";
 
 interface Project {
@@ -20,11 +18,6 @@ interface ImageFile {
 }
 
 type TabType = "downscale" | "process" | "pack";
-
-// Helper to get setting key for a project and tab
-function getProjectSettingKey(projectId: number, tab: string, key: string) {
-  return `project_${projectId}_${tab}_${key}`;
-}
 
 function App() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -187,10 +180,10 @@ function App() {
               <DownscaleTab key={currentProject.id} project={currentProject} />
             )}
             {activeTab === "process" && (
-              <ProcessTab key={currentProject.id} project={currentProject} />
+              <ProcessTab key={currentProject.id} />
             )}
             {activeTab === "pack" && (
-              <PackTab key={currentProject.id} project={currentProject} />
+              <PackTab key={currentProject.id} />
             )}
           </>
         )}
@@ -243,17 +236,6 @@ function DownscaleTab({ project }: { project: Project }) {
       }
     } catch (err) {
       console.error("Failed to load settings:", err);
-    }
-  }
-
-  async function saveSetting(key: string, value: any) {
-    try {
-      await invoke("set_app_setting", {
-        key,
-        value: String(value),
-      });
-    } catch (err) {
-      console.error(`Failed to save setting ${key}:`, err);
     }
   }
 
@@ -551,7 +533,7 @@ function DownscaleTab({ project }: { project: Project }) {
 }
 
 // Process Tab - Simplified for now, will add full implementation
-function ProcessTab({ project }: { project: Project }) {
+function ProcessTab() {
   return (
     <div className="tab-layout">
       <div className="main-area">
@@ -565,7 +547,7 @@ function ProcessTab({ project }: { project: Project }) {
 }
 
 // Pack Tab - Simplified for now
-function PackTab({ project }: { project: Project }) {
+function PackTab() {
   return (
     <div className="tab-layout">
       <div className="main-area">

@@ -4,6 +4,7 @@ version = "1.0.0"
 description = "Image processing and sprite sheet packing tool for pixel art"
 authors = ["SeveNeves"]
 edition = "2021"
+default-run = "pixels-toolkit"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

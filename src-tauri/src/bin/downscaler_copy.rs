@@ -3,7 +3,8 @@ use rustfft::{FftPlanner, num_complex::Complex};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::collections::VecDeque;
-use crate::error::{Result, PixelsError};
+
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownscalerSettings {
@@ -91,16 +92,32 @@ fn detect_grid_size(img: &RgbaImage) -> Option<f32> {
     }
 
     // Perform FFT on both profiles
-    // Use Python's proven range: 6-20
-    let h_period = fft_detect_period(&h_profile, 6.0, 20.0);
-    let v_period = fft_detect_period(&v_profile, 6.0, 20.0);
+    // Expanded range to catch smaller grids for sharper results
+    let h_period = fft_detect_period(&h_profile, 4.0, 32.0);
+    let v_period = fft_detect_period(&v_profile, 4.0, 32.0);
+
+    // Debug output
+    eprintln!("[DEBUG] FFT detected periods: H={:?}, V={:?}", h_period, v_period);
 
     // Return average if both detected
     match (h_period, v_period) {
-        (Some(h), Some(v)) => Some((h + v) / 2.0),
-        (Some(h), None) => Some(h),
-        (None, Some(v)) => Some(v),
-        (None, None) => None,
+        (Some(h), Some(v)) => {
+            let avg = (h + v) / 2.0;
+            eprintln!("[DEBUG] Using average period: {:.4}", avg);
+            Some(avg)
+        },
+        (Some(h), None) => {
+            eprintln!("[DEBUG] Using H period only: {:.4}", h);
+            Some(h)
+        },
+        (None, Some(v)) => {
+            eprintln!("[DEBUG] Using V period only: {:.4}", v);
+            Some(v)
+        },
+        (None, None) => {
+            eprintln!("[DEBUG] No period detected");
+            None
+        },
     }
 }
 
@@ -152,6 +169,10 @@ fn fft_detect_period(signal: &[f32], min_period: f32, max_period: f32) -> Option
 }
 
 /// Remove background using flood fill
+pub fn remove_background_public(img: &mut RgbaImage, settings: &DownscalerSettings) {
+    remove_background(img, settings);
+}
+
 fn remove_background(img: &mut RgbaImage, settings: &DownscalerSettings) {
     if matches!(settings.bg_removal_mode, BgRemovalMode::None) {
         return;
@@ -254,87 +275,17 @@ fn color_distance(c1: &Rgba<u8>, c2: &Rgba<u8>) -> i32 {
     (dr * dr + dg * dg + db * db).abs()
 }
 
-/// Measure information content (variance + edge count) - from Python
-fn information_content(img: &RgbaImage) -> f32 {
-    let (width, height) = img.dimensions();
-
-    // Calculate variance of visible pixels
-    let mut rgb_sum = [0.0f32; 3];
-    let mut count = 0;
-
-    for pixel in img.pixels() {
-        if pixel[3] > 0 {
-            rgb_sum[0] += pixel[0] as f32;
-            rgb_sum[1] += pixel[1] as f32;
-            rgb_sum[2] += pixel[2] as f32;
-            count += 1;
-        }
-    }
-
-    if count == 0 {
-        return 0.0;
-    }
-
-    let mean = [
-        rgb_sum[0] / count as f32,
-        rgb_sum[1] / count as f32,
-        rgb_sum[2] / count as f32,
-    ];
-
-    let mut variance = 0.0f32;
-    for pixel in img.pixels() {
-        if pixel[3] > 0 {
-            for i in 0..3 {
-                let diff = pixel[i] as f32 - mean[i];
-                variance += diff * diff;
-            }
-        }
-    }
-    variance /= (count * 3) as f32;
-
-    // Count edges (pixels with gradient > 20)
-    let mut edge_count = 0;
-
-    // Horizontal edges
-    for y in 0..height {
-        for x in 0..(width - 1) {
-            let p1 = img.get_pixel(x, y);
-            let p2 = img.get_pixel(x + 1, y);
-
-            let gray1 = (p1[0] as f32 + p1[1] as f32 + p1[2] as f32) / 3.0;
-            let gray2 = (p2[0] as f32 + p2[1] as f32 + p2[2] as f32) / 3.0;
-
-            if (gray1 - gray2).abs() > 20.0 {
-                edge_count += 1;
-            }
-        }
-    }
-
-    // Vertical edges
-    for y in 0..(height - 1) {
-        for x in 0..width {
-            let p1 = img.get_pixel(x, y);
-            let p2 = img.get_pixel(x, y + 1);
-
-            let gray1 = (p1[0] as f32 + p1[1] as f32 + p1[2] as f32) / 3.0;
-            let gray2 = (p2[0] as f32 + p2[1] as f32 + p2[2] as f32) / 3.0;
-
-            if (gray1 - gray2).abs() > 20.0 {
-                edge_count += 1;
-            }
-        }
-    }
-
-    variance + edge_count as f32 / 10.0
+/// Calculate grid alignment score (public wrapper for testing)
+pub fn grid_alignment_score_public(img: &RgbaImage, scale: f32) -> f32 {
+    grid_alignment_score(img, scale)
 }
 
-/// Calculate grid alignment score
 fn grid_alignment_score(img: &RgbaImage, scale: f32) -> f32 {
     let (width, height) = img.dimensions();
     let new_width = (width as f32 / scale).round() as u32;
     let new_height = (height as f32 / scale).round() as u32;
 
-    if new_width == 0 || new_height == 0 {
+    if new_width == 0 || new_height == 0 || new_width > width || new_height > height {
         return f32::MAX;
     }
 
@@ -346,175 +297,95 @@ fn grid_alignment_score(img: &RgbaImage, scale: f32) -> f32 {
         image::imageops::FilterType::Nearest,
     );
 
-    // Upscale back
-    let upscaled = image::imageops::resize(
-        &downscaled,
-        width,
-        height,
-        image::imageops::FilterType::Nearest,
-    );
-
-    // Calculate reconstruction error
-    let mut rgb_error = 0.0f32;
-    let mut alpha_error = 0.0f32;
+    // NEW SCORING: Count semi-transparent pixels and color variance
     let mut semi_transparent = 0;
-    let mut total_pixels = 0;
+    let mut fully_transparent = 0;
+    let mut fully_opaque = 0;
+    let mut color_variance = 0.0f32;
 
-    for y in 0..height {
-        for x in 0..width {
-            let orig = img.get_pixel(x, y);
-            let recon = upscaled.get_pixel(x, y);
-
-            if orig[3] > 0 {
-                total_pixels += 1;
-
-                // RGB MAE
-                for i in 0..3 {
-                    rgb_error += (orig[i] as f32 - recon[i] as f32).abs();
-                }
-
-                // Alpha error
-                alpha_error += (orig[3] as f32 - recon[3] as f32).abs();
-            }
-        }
-    }
-
-    // Count semi-transparent pixels in downscaled
     for pixel in downscaled.pixels() {
-        if pixel[3] > 0 && pixel[3] < 255 {
+        let alpha = pixel[3];
+
+        if alpha == 0 {
+            fully_transparent += 1;
+        } else if alpha == 255 {
+            fully_opaque += 1;
+        } else {
+            // Semi-transparent pixels indicate grid misalignment
             semi_transparent += 1;
+
+            // Penalize semi-transparency more
+            color_variance += (255 - alpha) as f32;
         }
     }
 
-    if total_pixels == 0 {
-        return f32::MAX;
-    }
+    let total_pixels = (new_width * new_height) as f32;
+    let semi_ratio = semi_transparent as f32 / total_pixels;
 
-    rgb_error /= (total_pixels * 3) as f32;
-    alpha_error /= total_pixels as f32;
-    let semi_ratio = semi_transparent as f32 / (new_width * new_height) as f32;
+    // Heavily penalize semi-transparent pixels (indicates grid misalignment)
+    // Add small penalty for larger output sizes to break ties
+    let size_penalty = (new_width as f32 + new_height as f32) * 0.01;
 
-    rgb_error + 0.5 * alpha_error + semi_ratio * 100.0
+    semi_ratio * 1000.0 + color_variance + size_penalty
 }
 
-/// Find optimal scale factor using Python's combined scoring
+/// Find optimal scale factor using broader search
 fn find_optimal_scale(img: &RgbaImage, min_scale: f32, max_scale: f32) -> f32 {
-    #[derive(Debug)]
-    struct ScaleResult {
-        scale: f32,
-        alignment_score: f32,
-        info_content: f32,
-        combined_score: f32,
-    }
+    // Expand search range significantly since FFT might be inaccurate
+    let actual_min = (min_scale - 8.0).max(2.0);
+    let actual_max = max_scale + 12.0;
 
-    let mut results = Vec::new();
+    eprintln!("[DEBUG] Searching scale range: {:.1} to {:.1}", actual_min, actual_max);
 
-    // Test integer scales in range (Python uses 6-20)
-    for scale_int in (min_scale.ceil() as u32)..=(max_scale.floor() as u32) {
+    let mut best_scale = actual_min;
+    let mut best_score = grid_alignment_score(img, best_scale);
+
+    for scale_int in (actual_min.ceil() as u32)..=(actual_max.floor() as u32) {
         let scale = scale_int as f32;
-        let alignment_score = grid_alignment_score(img, scale);
+        let score = grid_alignment_score(img, scale);
 
-        // Downscale to get information content
-        let (width, height) = img.dimensions();
-        let new_width = (width as f32 / scale).round() as u32;
-        let new_height = (height as f32 / scale).round() as u32;
-
-        if new_width == 0 || new_height == 0 {
-            continue;
-        }
-
-        let downscaled = image::imageops::resize(
-            img,
-            new_width,
-            new_height,
-            image::imageops::FilterType::Nearest,
-        );
-
-        let info_content = information_content(&downscaled);
-
-        // KEY: Combined score subtracts info (favors detail preservation)
-        let combined_score = alignment_score - info_content / 1000.0;
-
-        results.push(ScaleResult {
-            scale,
-            alignment_score,
-            info_content,
-            combined_score,
-        });
-    }
-
-    if results.is_empty() {
-        return min_scale;
-    }
-
-    // Find best combined score
-    let best = results.iter()
-        .min_by(|a, b| a.combined_score.partial_cmp(&b.combined_score).unwrap())
-        .unwrap();
-
-    // Python logic: Check if grid-aligned scale is within 20% of best
-    // If grid size is close to an integer, prefer that
-    let grid_aligned_scale = min_scale.round();
-    if let Some(grid_result) = results.iter().find(|r| r.scale == grid_aligned_scale) {
-        if grid_result.combined_score <= best.combined_score * 1.2 {
-            return grid_aligned_scale;
+        if score < best_score {
+            best_score = score;
+            best_scale = scale;
+            eprintln!("[DEBUG]   New best: scale={}, score={:.2}", scale, score);
         }
     }
 
-    best.scale
+    eprintln!("[DEBUG] Best integer scale: {}, score: {:.2}", best_scale, best_score);
+    best_scale
 }
 
-/// Fine-tune scale with fractional values using combined scoring
+/// Fine-tune scale with fractional values
 fn fine_tune_scale(img: &RgbaImage, base_scale: f32) -> f32 {
     let mut best_scale = base_scale;
+    let mut best_score = grid_alignment_score(img, best_scale);
 
-    // Calculate initial combined score
-    let (width, height) = img.dimensions();
-    let mut best_score = {
-        let alignment_score = grid_alignment_score(img, best_scale);
-        let new_width = (width as f32 / best_scale).round() as u32;
-        let new_height = (height as f32 / best_scale).round() as u32;
-
-        if new_width == 0 || new_height == 0 {
-            return best_scale;
-        }
-
-        let downscaled = image::imageops::resize(
-            img,
-            new_width,
-            new_height,
-            image::imageops::FilterType::Nearest,
-        );
-        let info_content = information_content(&downscaled);
-        alignment_score - info_content / 1000.0
-    };
-
-    // Test fractional scales around base with 0.1 steps
+    // Test fractional scales around base with higher precision
+    // First pass: coarse search ±1.0 with 0.1 steps
     for offset in -10..=10 {
         let scale = base_scale + (offset as f32 * 0.1);
         if scale < 1.0 {
             continue;
         }
 
-        let alignment_score = grid_alignment_score(img, scale);
-        let new_width = (width as f32 / scale).round() as u32;
-        let new_height = (height as f32 / scale).round() as u32;
+        let score = grid_alignment_score(img, scale);
+        if score < best_score {
+            best_score = score;
+            best_scale = scale;
+        }
+    }
 
-        if new_width == 0 || new_height == 0 {
+    // Second pass: fine search ±0.2 around best with 0.02 steps
+    let coarse_best = best_scale;
+    for offset in -10..=10 {
+        let scale = coarse_best + (offset as f32 * 0.02);
+        if scale < 1.0 {
             continue;
         }
 
-        let downscaled = image::imageops::resize(
-            img,
-            new_width,
-            new_height,
-            image::imageops::FilterType::Nearest,
-        );
-        let info_content = information_content(&downscaled);
-        let combined_score = alignment_score - info_content / 1000.0;
-
-        if combined_score < best_score {
-            best_score = combined_score;
+        let score = grid_alignment_score(img, scale);
+        if score < best_score {
+            best_score = score;
             best_scale = scale;
         }
     }
@@ -582,8 +453,7 @@ pub fn downscale_image(
     settings: DownscalerSettings,
 ) -> Result<DownscaleResult> {
     // Load image
-    let img = image::open(&input_path)
-        .map_err(|e| PixelsError::Processing(format!("Failed to load {}: {}", input_path.display(), e)))?;
+    let img = image::open(&input_path)?;
 
     let mut rgba = img.to_rgba8();
     let original_size = rgba.dimensions();
@@ -594,13 +464,18 @@ pub fn downscale_image(
     // Detect grid size
     let detected_scale = detect_grid_size(&rgba);
 
-    let scale = if detected_scale.is_some() {
-        // Python uses fixed range 6-20 for comprehensive search
-        let base_scale = find_optimal_scale(&rgba, 6.0, 20.0);
+    let scale = if let Some(grid_size) = detected_scale {
+        eprintln!("[DEBUG] Detected grid size: {:.4}", grid_size);
+
+        // Find optimal scale in detected range
+        let base_scale = find_optimal_scale(&rgba, (grid_size - 2.0).max(2.0), grid_size + 2.0);
+        eprintln!("[DEBUG] Base scale after optimization: {:.4}", base_scale);
 
         // Fine-tune if enabled
         if settings.enable_fine_tune {
-            fine_tune_scale(&rgba, base_scale)
+            let final_scale = fine_tune_scale(&rgba, base_scale);
+            eprintln!("[DEBUG] Final scale after fine-tuning: {:.4}", final_scale);
+            final_scale
         } else {
             base_scale
         }
