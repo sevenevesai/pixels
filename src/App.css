@@ -292,6 +292,12 @@
   font-size: 0.8rem;
 }
 
+.settings-panel hr {
+  border: none;
+  border-top: 1px solid #ddd;
+  margin: 1.5rem 0;
+}
+
 /* Buttons */
 button {
   padding: 0.6rem 1rem;

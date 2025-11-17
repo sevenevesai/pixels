@@ -91,8 +91,9 @@ fn detect_grid_size(img: &RgbaImage) -> Option<f32> {
     }
 
     // Perform FFT on both profiles
-    let h_period = fft_detect_period(&h_profile, 6.0, 20.0);
-    let v_period = fft_detect_period(&v_profile, 6.0, 20.0);
+    // Expanded range to catch smaller grids for sharper results
+    let h_period = fft_detect_period(&h_profile, 4.0, 24.0);
+    let v_period = fft_detect_period(&v_profile, 4.0, 24.0);
 
     // Return average if both detected
     match (h_period, v_period) {
@@ -345,9 +346,25 @@ fn fine_tune_scale(img: &RgbaImage, base_scale: f32) -> f32 {
     let mut best_scale = base_scale;
     let mut best_score = grid_alignment_score(img, best_scale);
 
-    // Test fractional scales around base
+    // Test fractional scales around base with higher precision
+    // First pass: coarse search ±1.0 with 0.1 steps
     for offset in -10..=10 {
-        let scale = base_scale + (offset as f32 * 0.05);
+        let scale = base_scale + (offset as f32 * 0.1);
+        if scale < 1.0 {
+            continue;
+        }
+
+        let score = grid_alignment_score(img, scale);
+        if score < best_score {
+            best_score = score;
+            best_scale = scale;
+        }
+    }
+
+    // Second pass: fine search ±0.2 around best with 0.02 steps
+    let coarse_best = best_scale;
+    for offset in -10..=10 {
+        let scale = coarse_best + (offset as f32 * 0.02);
         if scale < 1.0 {
             continue;
         }

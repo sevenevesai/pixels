@@ -202,21 +202,10 @@ function App() {
 // Downscale Tab with full features and settings persistence
 function DownscaleTab({ project }: { project: Project }) {
   const [inputFolder, setInputFolder] = useState(project.path);
-  const [outputFolderName, setOutputFolderName] = useState("downscaled");
+  const [outputFolder, setOutputFolder] = useState("");
   const [images, setImages] = useState<ImageFile[]>([]);
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState("");
-
-  // Settings
-  const [bgRemovalMode, setBgRemovalMode] = useState("conservative");
-  const [bgTolerance, setBgTolerance] = useState(15);
-  const [bgEdgeTolerance, setBgEdgeTolerance] = useState(25);
-  const [autoTrim, setAutoTrim] = useState(true);
-  const [enableFineTune, setEnableFineTune] = useState(true);
-  const [padCanvas, setPadCanvas] = useState(true);
-  const [canvasMultiple, setCanvasMultiple] = useState(16);
-  const [preserveDarkLines, setPreserveDarkLines] = useState(true);
-  const [darkLineThreshold, setDarkLineThreshold] = useState(50);
 
   // Load settings on mount
   useEffect(() => {
@@ -231,51 +220,27 @@ function DownscaleTab({ project }: { project: Project }) {
 
   async function loadSettings() {
     try {
-      // Load project-specific folder
-      const savedFolder = await invoke<string | null>("get_project_setting", {
+      // Load project-specific input folder
+      const savedInputFolder = await invoke<string | null>("get_project_setting", {
         projectId: project.id,
         key: "downscale_input_folder",
       });
-      if (savedFolder) {
-        setInputFolder(savedFolder);
+      if (savedInputFolder) {
+        setInputFolder(savedInputFolder);
       }
 
-      // Load project-specific output folder name
-      const savedOutputName = await invoke<string | null>("get_project_setting", {
+      // Load project-specific output folder
+      const savedOutputFolder = await invoke<string | null>("get_project_setting", {
         projectId: project.id,
         key: "downscale_output_folder",
       });
-      if (savedOutputName) {
-        setOutputFolderName(savedOutputName);
+      if (savedOutputFolder) {
+        setOutputFolder(savedOutputFolder);
+      } else {
+        // Default to project path + "downscaled" subfolder
+        const pathSeparator = project.path.includes("\\") ? "\\" : "/";
+        setOutputFolder(`${project.path}${pathSeparator}downscaled`);
       }
-
-      // Load global settings
-      const loadSetting = async (key: string, defaultVal: any, setter: Function) => {
-        try {
-          const val = await invoke<string | null>("get_app_setting", { key });
-          if (val !== null) {
-            if (typeof defaultVal === "boolean") {
-              setter(val === "true");
-            } else if (typeof defaultVal === "number") {
-              setter(Number(val));
-            } else {
-              setter(val);
-            }
-          }
-        } catch (e) {
-          console.warn(`Failed to load setting ${key}:`, e);
-        }
-      };
-
-      await loadSetting("downscale_bg_removal_mode", bgRemovalMode, setBgRemovalMode);
-      await loadSetting("downscale_bg_tolerance", bgTolerance, setBgTolerance);
-      await loadSetting("downscale_bg_edge_tolerance", bgEdgeTolerance, setBgEdgeTolerance);
-      await loadSetting("downscale_auto_trim", autoTrim, setAutoTrim);
-      await loadSetting("downscale_enable_fine_tune", enableFineTune, setEnableFineTune);
-      await loadSetting("downscale_pad_canvas", padCanvas, setPadCanvas);
-      await loadSetting("downscale_canvas_multiple", canvasMultiple, setCanvasMultiple);
-      await loadSetting("downscale_preserve_dark_lines", preserveDarkLines, setPreserveDarkLines);
-      await loadSetting("downscale_dark_line_threshold", darkLineThreshold, setDarkLineThreshold);
     } catch (err) {
       console.error("Failed to load settings:", err);
     }
@@ -321,6 +286,23 @@ function DownscaleTab({ project }: { project: Project }) {
     }
   }
 
+  async function selectOutputFolder() {
+    try {
+      const directory = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: outputFolder || project.path,
+      });
+
+      if (directory) {
+        setOutputFolder(directory as string);
+        await saveProjectSetting("downscale_output_folder", directory as string);
+      }
+    } catch (err) {
+      console.error("Failed to select output folder:", err);
+    }
+  }
+
   async function loadImages() {
     try {
       const entries = await readDir(inputFolder);
@@ -340,10 +322,35 @@ function DownscaleTab({ project }: { project: Project }) {
           const pathSeparator = inputFolder.includes("\\") ? "\\" : "/";
           const fullPath = `${inputFolder}${pathSeparator}${entry.name}`;
 
+          // Read image file as base64 for thumbnail
+          let thumbnail: string | undefined;
+          try {
+            const fileData = await readFile(fullPath);
+            const base64 = btoa(
+              new Uint8Array(fileData).reduce(
+                (data, byte) => data + String.fromCharCode(byte),
+                ""
+              )
+            );
+            // Determine MIME type from extension
+            let mimeType = "image/png";
+            if (name.endsWith(".jpg") || name.endsWith(".jpeg")) {
+              mimeType = "image/jpeg";
+            } else if (name.endsWith(".webp")) {
+              mimeType = "image/webp";
+            } else if (name.endsWith(".bmp")) {
+              mimeType = "image/bmp";
+            }
+            thumbnail = `data:${mimeType};base64,${base64}`;
+          } catch (thumbErr) {
+            console.warn(`Failed to load thumbnail for ${entry.name}:`, thumbErr);
+          }
+
           imageFiles.push({
             name: entry.name,
             path: fullPath,
             selected: true,
+            thumbnail,
           });
         }
       }
@@ -356,19 +363,21 @@ function DownscaleTab({ project }: { project: Project }) {
   }
 
   async function smartSelect() {
-    try {
-      const pathSeparator = project.path.includes("\\") ? "\\" : "/";
-      const outputPath = `${project.path}${pathSeparator}${outputFolderName}`;
+    if (!outputFolder) {
+      alert("Please select an output folder first");
+      return;
+    }
 
+    try {
       // Check if output folder exists
-      const outputExists = await exists(outputPath);
+      const outputExists = await exists(outputFolder);
       if (!outputExists) {
         // No output folder, select all
         setImages((imgs) => imgs.map((img) => ({ ...img, selected: true })));
         return;
       }
 
-      const outputEntries = await readDir(outputPath);
+      const outputEntries = await readDir(outputFolder);
       const outputNames = new Set(outputEntries.map((e) => e.name));
 
       setImages((imgs) =>
@@ -405,31 +414,35 @@ function DownscaleTab({ project }: { project: Project }) {
       return;
     }
 
+    if (!outputFolder) {
+      alert("Please select an output folder first");
+      return;
+    }
+
     setProcessing(true);
     setProgress(`Processing 0/${selectedImages.length}...`);
 
     try {
-      const outputPath = await join(project.path, outputFolderName);
-
       for (let i = 0; i < selectedImages.length; i++) {
         const img = selectedImages[i];
         setProgress(`Processing ${i + 1}/${selectedImages.length}: ${img.name}`);
 
-        const outputFilePath = await join(outputPath, img.name);
+        const pathSeparator = outputFolder.includes("\\") ? "\\" : "/";
+        const outputFilePath = `${outputFolder}${pathSeparator}${img.name}`;
 
         await invoke("downscale_image_command", {
           inputPath: img.path,
           outputPath: outputFilePath,
           settings: {
-            bg_removal_mode: bgRemovalMode,
-            bg_tolerance: bgTolerance,
-            bg_edge_tolerance: bgEdgeTolerance,
-            preserve_dark_lines: preserveDarkLines,
-            dark_line_threshold: darkLineThreshold,
-            auto_trim: autoTrim,
-            enable_fine_tune: enableFineTune,
-            pad_canvas: padCanvas,
-            canvas_multiple: canvasMultiple,
+            bg_removal_mode: "conservative",
+            bg_tolerance: 15,
+            bg_edge_tolerance: 30,
+            preserve_dark_lines: false, // Post-processing handles outlines
+            dark_line_threshold: 100,
+            auto_trim: true,
+            enable_fine_tune: true, // Always use fine-tuning for accuracy
+            pad_canvas: false,
+            canvas_multiple: 16,
           },
         });
       }
@@ -482,7 +495,11 @@ function DownscaleTab({ project }: { project: Project }) {
                 onClick={() => toggleImage(i)}
               >
                 <div className="image-thumb">
-                  <img src={convertFileSrc(img.path)} alt={img.name} />
+                  {img.thumbnail ? (
+                    <img src={img.thumbnail} alt={img.name} />
+                  ) : (
+                    <div style={{ color: "#999" }}>No preview</div>
+                  )}
                 </div>
                 <div className="image-name">{img.name}</div>
                 {img.selected && <div className="selected-indicator">✓</div>}
@@ -505,154 +522,28 @@ function DownscaleTab({ project }: { project: Project }) {
       </div>
 
       <div className="settings-panel">
-        <h3>Settings</h3>
+        <h3>Output</h3>
 
         <div className="setting-group">
-          <label>Output Folder Name</label>
-          <input
-            type="text"
-            value={outputFolderName}
-            onChange={(e) => {
-              setOutputFolderName(e.target.value);
-              saveProjectSetting("downscale_output_folder", e.target.value);
-            }}
-          />
-          <small>Folder name relative to project path</small>
-        </div>
-
-        <div className="setting-group">
-          <label>
-            <input
-              type="checkbox"
-              checked={enableFineTune}
-              onChange={(e) => {
-                setEnableFineTune(e.target.checked);
-                saveSetting("downscale_enable_fine_tune", e.target.checked);
-              }}
-            />
-            Enable Fine-Tune
-          </label>
-          <small>Test fractional scale factors for better results</small>
+          <label>Output Folder</label>
+          <button onClick={selectOutputFolder} className="btn" style={{ width: "100%", marginBottom: "0.5rem" }}>
+            📁 Select Output Folder
+          </button>
+          {outputFolder && (
+            <small style={{ display: "block", marginTop: "0.5rem", wordBreak: "break-all" }}>
+              {outputFolder}
+            </small>
+          )}
         </div>
 
         <hr />
 
         <div className="setting-group">
-          <label>Background Removal</label>
-          <select
-            value={bgRemovalMode}
-            onChange={(e) => {
-              setBgRemovalMode(e.target.value);
-              saveSetting("downscale_bg_removal_mode", e.target.value);
-            }}
-          >
-            <option value="conservative">Conservative</option>
-            <option value="aggressive">Aggressive</option>
-            <option value="none">None</option>
-          </select>
-        </div>
-
-        <div className="setting-group">
-          <label>BG Tolerance: {bgTolerance}</label>
-          <input
-            type="range"
-            min="5"
-            max="50"
-            value={bgTolerance}
-            onChange={(e) => {
-              setBgTolerance(Number(e.target.value));
-              saveSetting("downscale_bg_tolerance", e.target.value);
-            }}
-          />
-        </div>
-
-        <div className="setting-group">
-          <label>BG Edge Tolerance: {bgEdgeTolerance}</label>
-          <input
-            type="range"
-            min="10"
-            max="80"
-            value={bgEdgeTolerance}
-            onChange={(e) => {
-              setBgEdgeTolerance(Number(e.target.value));
-              saveSetting("downscale_bg_edge_tolerance", e.target.value);
-            }}
-          />
-        </div>
-
-        <hr />
-
-        <div className="setting-group">
-          <label>
-            <input
-              type="checkbox"
-              checked={preserveDarkLines}
-              onChange={(e) => {
-                setPreserveDarkLines(e.target.checked);
-                saveSetting("downscale_preserve_dark_lines", e.target.checked);
-              }}
-            />
-            Preserve Dark Lines
-          </label>
-        </div>
-
-        <div className="setting-group">
-          <label>Dark Line Threshold: {darkLineThreshold}</label>
-          <input
-            type="range"
-            min="0"
-            max="150"
-            value={darkLineThreshold}
-            onChange={(e) => {
-              setDarkLineThreshold(Number(e.target.value));
-              saveSetting("downscale_dark_line_threshold", e.target.value);
-            }}
-          />
-        </div>
-
-        <hr />
-
-        <div className="setting-group">
-          <label>
-            <input
-              type="checkbox"
-              checked={autoTrim}
-              onChange={(e) => {
-                setAutoTrim(e.target.checked);
-                saveSetting("downscale_auto_trim", e.target.checked);
-              }}
-            />
-            Auto Trim Transparency
-          </label>
-        </div>
-
-        <div className="setting-group">
-          <label>
-            <input
-              type="checkbox"
-              checked={padCanvas}
-              onChange={(e) => {
-                setPadCanvas(e.target.checked);
-                saveSetting("downscale_pad_canvas", e.target.checked);
-              }}
-            />
-            Pad Canvas to Multiple
-          </label>
-        </div>
-
-        <div className="setting-group">
-          <label>Canvas Multiple: {canvasMultiple}</label>
-          <input
-            type="range"
-            min="8"
-            max="128"
-            step="8"
-            value={canvasMultiple}
-            onChange={(e) => {
-              setCanvasMultiple(Number(e.target.value));
-              saveSetting("downscale_canvas_multiple", e.target.value);
-            }}
-          />
+          <h4 style={{ margin: "0 0 0.5rem 0", fontSize: "0.95rem", color: "#666" }}>How it works</h4>
+          <small style={{ lineHeight: "1.6" }}>
+            AI-generated pixel art is actually high-resolution images that mimic nearest-neighbor upscaling.
+            This tool automatically detects the grid pattern and downscales to the true pixel resolution.
+          </small>
         </div>
       </div>
     </div>
