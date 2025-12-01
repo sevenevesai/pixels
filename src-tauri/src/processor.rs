@@ -1,25 +1,41 @@
-use image::{RgbaImage, Rgba, ImageBuffer};
+//! Post-Processing Module for Pixel Art
+//!
+//! Three main features (matching Python's image_processor.py exactly):
+//! 1. Opacity Normalization - Quantize alpha to 0 or 255
+//! 2. Color Simplification - LAB color space clustering to merge similar colors
+//! 3. Outline Generation - Add outline/border around sprites (grows inward)
+
+use image::{RgbaImage, Rgba};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use crate::error::{Result, PixelsError};
 
+// ============================================================================
+// SETTINGS
+// ============================================================================
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessorSettings {
-    // Opacity normalization
+    /// Alpha threshold below which pixels become fully transparent (default: 200)
     pub alpha_low_cutoff: u8,
+    /// Lower bound of range for making pixels fully opaque (default: 200)
     pub alpha_high_min: u8,
+    /// Upper bound of range for making pixels fully opaque (default: 255)
     pub alpha_high_max: u8,
-
-    // Color simplification
+    /// Enable color simplification via LAB clustering (default: true)
     pub enable_color_simplify: bool,
+    /// Delta E76 threshold for color clustering - lower = more aggressive merging (default: 3.0)
     pub lab_merge_threshold: f32,
-
-    // Outline generation
+    /// Enable outline generation (default: true)
     pub enable_outline: bool,
+    /// Outline color as RGBA tuple (default: (17, 6, 2, 255) - dark brown)
     pub outline_color: (u8, u8, u8, u8),
+    /// Alpha threshold for edge detection - pixels <= this are transparent (default: 0)
     pub edge_transparent_cutoff: u8,
+    /// Neighbor connectivity: "four" or "eight" (default: four)
     pub outline_connectivity: Connectivity,
+    /// Outline thickness in pixels to grow inward (default: 1)
     pub outline_thickness: u32,
 }
 
@@ -33,137 +49,131 @@ pub enum Connectivity {
 impl Default for ProcessorSettings {
     fn default() -> Self {
         Self {
-            alpha_low_cutoff: 30,
+            // Python defaults from settings_manager.py
+            alpha_low_cutoff: 200,
             alpha_high_min: 200,
             alpha_high_max: 255,
             enable_color_simplify: true,
-            lab_merge_threshold: 10.0,
-            enable_outline: false,
-            outline_color: (0, 0, 0, 255),
-            edge_transparent_cutoff: 128,
+            lab_merge_threshold: 3.0,
+            enable_outline: true,
+            outline_color: (17, 6, 2, 255), // Dark brown
+            edge_transparent_cutoff: 0,
             outline_connectivity: Connectivity::Four,
             outline_thickness: 1,
         }
     }
 }
 
-/// RGB to LAB color space conversion
-fn rgb_to_lab(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
-    // Convert to 0-1 range
-    let mut r = r as f32 / 255.0;
-    let mut g = g as f32 / 255.0;
-    let mut b = b as f32 / 255.0;
-
-    // Apply sRGB gamma correction
-    r = if r > 0.04045 {
-        ((r + 0.055) / 1.055).powf(2.4)
-    } else {
-        r / 12.92
-    };
-    g = if g > 0.04045 {
-        ((g + 0.055) / 1.055).powf(2.4)
-    } else {
-        g / 12.92
-    };
-    b = if b > 0.04045 {
-        ((b + 0.055) / 1.055).powf(2.4)
-    } else {
-        b / 12.92
-    };
-
-    // Convert to XYZ using D65 illuminant
-    let x = r * 0.4124564 + g * 0.3575761 + b * 0.1804375;
-    let y = r * 0.2126729 + g * 0.7151522 + b * 0.0721750;
-    let z = r * 0.0193339 + g * 0.1191920 + b * 0.9503041;
-
-    // Normalize by D65 white point
-    let x = x / 0.95047;
-    let y = y / 1.00000;
-    let z = z / 1.08883;
-
-    // Apply LAB transformation
-    let fx = if x > 0.008856 {
-        x.powf(1.0 / 3.0)
-    } else {
-        (7.787 * x) + (16.0 / 116.0)
-    };
-    let fy = if y > 0.008856 {
-        y.powf(1.0 / 3.0)
-    } else {
-        (7.787 * y) + (16.0 / 116.0)
-    };
-    let fz = if z > 0.008856 {
-        z.powf(1.0 / 3.0)
-    } else {
-        (7.787 * z) + (16.0 / 116.0)
-    };
-
-    let l = (116.0 * fy) - 16.0;
-    let a = 500.0 * (fx - fy);
-    let b = 200.0 * (fy - fz);
-
-    (l, a, b)
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessorResult {
+    pub original_size: (u32, u32),
+    pub unique_colors_before: usize,
+    pub unique_colors_after: usize,
+    pub clusters_created: usize,
 }
 
-/// LAB to RGB color space conversion
+// ============================================================================
+// COLOR SPACE CONVERSIONS (sRGB <-> XYZ <-> LAB)
+// Exact match to Python's rgb_to_lab() and lab_to_rgb()
+// ============================================================================
+
+/// Convert sRGB (0-255) to LAB color space
+fn rgb_to_lab(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    // Step 1: sRGB to Linear RGB (gamma correction)
+    fn srgb_to_linear(c: u8) -> f32 {
+        let c = c as f32 / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    let rl = srgb_to_linear(r);
+    let gl = srgb_to_linear(g);
+    let bl = srgb_to_linear(b);
+
+    // Step 2: Linear RGB to XYZ (standard matrix)
+    let x = rl * 0.4124564 + gl * 0.3575761 + bl * 0.1804375;
+    let y = rl * 0.2126729 + gl * 0.7151522 + bl * 0.0721750;
+    let z = rl * 0.0193339 + gl * 0.1191920 + bl * 0.9503041;
+
+    // Step 3: XYZ to LAB (D65 illuminant)
+    const XN: f32 = 0.95047;
+    const YN: f32 = 1.00000;
+    const ZN: f32 = 1.08883;
+
+    let xr = x / XN;
+    let yr = y / YN;
+    let zr = z / ZN;
+
+    fn f(t: f32) -> f32 {
+        if t > 0.008856 {
+            t.powf(1.0 / 3.0)
+        } else {
+            7.787 * t + 16.0 / 116.0
+        }
+    }
+
+    let fx = f(xr);
+    let fy = f(yr);
+    let fz = f(zr);
+
+    let l = (116.0 * fy - 16.0).max(0.0);
+    let a = 500.0 * (fx - fy);
+    let lab_b = 200.0 * (fy - fz);
+
+    (l, a, lab_b)
+}
+
+/// Convert LAB color space back to sRGB (0-255)
 fn lab_to_rgb(l: f32, a: f32, b: f32) -> (u8, u8, u8) {
-    // Convert LAB to XYZ
+    // Step 1: LAB to XYZ
+    const XN: f32 = 0.95047;
+    const YN: f32 = 1.00000;
+    const ZN: f32 = 1.08883;
+
     let fy = (l + 16.0) / 116.0;
     let fx = a / 500.0 + fy;
     let fz = fy - b / 200.0;
 
-    let xr = if fx.powi(3) > 0.008856 {
-        fx.powi(3)
-    } else {
-        (fx - 16.0 / 116.0) / 7.787
-    };
-    let yr = if fy.powi(3) > 0.008856 {
-        fy.powi(3)
-    } else {
-        (fy - 16.0 / 116.0) / 7.787
-    };
-    let zr = if fz.powi(3) > 0.008856 {
-        fz.powi(3)
-    } else {
-        (fz - 16.0 / 116.0) / 7.787
-    };
+    fn f_inv(t: f32) -> f32 {
+        let t3 = t * t * t;
+        if t3 > 0.008856 {
+            t3
+        } else {
+            (t - 16.0 / 116.0) / 7.787
+        }
+    }
 
-    // Denormalize by D65 white point
-    let x = xr * 0.95047;
-    let y = yr * 1.00000;
-    let z = zr * 1.08883;
+    let xr = f_inv(fx);
+    let yr = f_inv(fy);
+    let zr = f_inv(fz);
 
-    // Convert XYZ to linear RGB
-    let mut r = x * 3.2404542 + y * -1.5371385 + z * -0.4985314;
-    let mut g = x * -0.9692660 + y * 1.8760108 + z * 0.0415560;
-    let mut b = x * 0.0556434 + y * -0.2040259 + z * 1.0572252;
+    let x = xr * XN;
+    let y = yr * YN;
+    let z = zr * ZN;
 
-    // Apply sRGB gamma correction
-    r = if r > 0.0031308 {
-        1.055 * r.powf(1.0 / 2.4) - 0.055
-    } else {
-        12.92 * r
-    };
-    g = if g > 0.0031308 {
-        1.055 * g.powf(1.0 / 2.4) - 0.055
-    } else {
-        12.92 * g
-    };
-    b = if b > 0.0031308 {
-        1.055 * b.powf(1.0 / 2.4) - 0.055
-    } else {
-        12.92 * b
-    };
+    // Step 2: XYZ to Linear RGB (inverse matrix)
+    let rl = x *  3.2404542 + y * -1.5371385 + z * -0.4985314;
+    let gl = x * -0.9692660 + y *  1.8760108 + z *  0.0415560;
+    let bl = x *  0.0556434 + y * -0.2040259 + z *  1.0572252;
 
-    // Clamp and convert to u8
-    let r = (r * 255.0).clamp(0.0, 255.0) as u8;
-    let g = (g * 255.0).clamp(0.0, 255.0) as u8;
-    let b = (b * 255.0).clamp(0.0, 255.0) as u8;
+    // Step 3: Linear RGB to sRGB (inverse gamma)
+    fn linear_to_srgb(c: f32) -> u8 {
+        let c = c.clamp(0.0, 1.0);
+        let v = if c <= 0.0031308 {
+            12.92 * c
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        };
+        (v * 255.0).round().clamp(0.0, 255.0) as u8
+    }
 
-    (r, g, b)
+    (linear_to_srgb(rl), linear_to_srgb(gl), linear_to_srgb(bl))
 }
 
-/// Calculate Delta E76 color distance in LAB space
+/// Calculate Delta E76 color difference in LAB space
 fn delta_e76(lab1: (f32, f32, f32), lab2: (f32, f32, f32)) -> f32 {
     let dl = lab1.0 - lab2.0;
     let da = lab1.1 - lab2.1;
@@ -171,198 +181,227 @@ fn delta_e76(lab1: (f32, f32, f32), lab2: (f32, f32, f32)) -> f32 {
     (dl * dl + da * da + db * db).sqrt()
 }
 
-/// Normalize opacity values
-fn normalize_opacity(img: &mut RgbaImage, settings: &ProcessorSettings) {
-    for pixel in img.pixels_mut() {
-        let alpha = pixel[3];
+// ============================================================================
+// STEP 1: OPACITY NORMALIZATION
+// Exact match to Python lines 77-89
+// ============================================================================
 
-        // Low cutoff: set to transparent
-        if alpha < settings.alpha_low_cutoff {
-            pixel[3] = 0;
-        }
-        // High range: set to opaque
-        else if alpha >= settings.alpha_high_min && alpha <= settings.alpha_high_max {
-            pixel[3] = 255;
+fn normalize_opacity(img: &mut RgbaImage, settings: &ProcessorSettings) {
+    let (width, height) = img.dimensions();
+
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = img.get_pixel_mut(x, y);
+            let alpha = pixel[3];
+
+            if alpha < settings.alpha_low_cutoff {
+                pixel[3] = 0;
+            } else if alpha >= settings.alpha_high_min && alpha <= settings.alpha_high_max {
+                pixel[3] = 255;
+            }
         }
     }
 }
 
-/// Simplify colors using LAB clustering
-fn simplify_colors(img: &mut RgbaImage, threshold: f32) {
+// ============================================================================
+// STEP 2: COLOR SIMPLIFICATION (LAB Clustering)
+// Exact match to Python lines 91-149
+// Key: greedy first-fit assignment, sorted by frequency, track members
+// ============================================================================
+
+struct LabCluster {
+    center_lab: (f32, f32, f32),
+    sum_l: f32,
+    sum_a: f32,
+    sum_b: f32,
+    count: u32,
+    members: Vec<((u8, u8, u8), u32)>,
+}
+
+impl LabCluster {
+    fn new(rgb: (u8, u8, u8), lab: (f32, f32, f32), count: u32) -> Self {
+        Self {
+            center_lab: lab,
+            sum_l: lab.0 * count as f32,
+            sum_a: lab.1 * count as f32,
+            sum_b: lab.2 * count as f32,
+            count,
+            members: vec![(rgb, count)],
+        }
+    }
+
+    fn add(&mut self, rgb: (u8, u8, u8), lab: (f32, f32, f32), count: u32) {
+        self.members.push((rgb, count));
+        self.sum_l += lab.0 * count as f32;
+        self.sum_a += lab.1 * count as f32;
+        self.sum_b += lab.2 * count as f32;
+        self.count += count;
+        // Update center (weighted average) - Python lines 116-120
+        self.center_lab = (
+            self.sum_l / self.count as f32,
+            self.sum_a / self.count as f32,
+            self.sum_b / self.count as f32,
+        );
+    }
+}
+
+fn simplify_colors(img: &mut RgbaImage, threshold: f32) -> (usize, usize, usize) {
     let (width, height) = img.dimensions();
 
-    // Count unique colors and their frequencies
+    // Collect unique colors with counts (Python lines 96-102)
     let mut color_counts: HashMap<(u8, u8, u8), u32> = HashMap::new();
     for y in 0..height {
         for x in 0..width {
             let pixel = img.get_pixel(x, y);
-            if pixel[3] > 0 {
-                // Only process non-transparent pixels
-                let rgb = (pixel[0], pixel[1], pixel[2]);
-                *color_counts.entry(rgb).or_insert(0) += 1;
+            if pixel[3] >= 1 {
+                let key = (pixel[0], pixel[1], pixel[2]);
+                *color_counts.entry(key).or_insert(0) += 1;
             }
         }
     }
 
-    // Sort colors by frequency (most common first)
-    let mut colors: Vec<_> = color_counts.into_iter().collect();
-    colors.sort_by(|a, b| b.1.cmp(&a.1));
-
-    // Build color clusters
-    #[derive(Clone)]
-    struct Cluster {
-        lab: (f32, f32, f32),
-        weight: f32,
+    let unique_before = color_counts.len();
+    if color_counts.is_empty() {
+        return (0, 0, 0);
     }
 
-    let mut clusters: Vec<Cluster> = Vec::new();
+    // Sort by frequency descending (Python line 107)
+    let mut items: Vec<_> = color_counts.into_iter().collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1));
 
-    for (rgb, count) in colors {
-        let lab = rgb_to_lab(rgb.0, rgb.1, rgb.2);
-        let weight = count as f32;
+    // Build LAB clusters using greedy assignment (Python lines 109-132)
+    let mut clusters: Vec<LabCluster> = Vec::new();
 
-        // Find nearest cluster
-        let mut merged = false;
+    for ((r, g, b), count) in items {
+        let lab = rgb_to_lab(r, g, b);
+        let mut assigned = false;
+
         for cluster in &mut clusters {
-            if delta_e76(lab, cluster.lab) <= threshold {
-                // Merge into this cluster (weighted average)
-                let total_weight = cluster.weight + weight;
-                cluster.lab.0 = (cluster.lab.0 * cluster.weight + lab.0 * weight) / total_weight;
-                cluster.lab.1 = (cluster.lab.1 * cluster.weight + lab.1 * weight) / total_weight;
-                cluster.lab.2 = (cluster.lab.2 * cluster.weight + lab.2 * weight) / total_weight;
-                cluster.weight = total_weight;
-                merged = true;
+            if delta_e76(lab, cluster.center_lab) <= threshold {
+                cluster.add((r, g, b), lab, count);
+                assigned = true;
                 break;
             }
         }
 
-        // Create new cluster if not merged
-        if !merged {
-            clusters.push(Cluster { lab, weight });
+        if !assigned {
+            clusters.push(LabCluster::new((r, g, b), lab, count));
         }
     }
 
-    // Build color mapping
-    let mut color_map: HashMap<(u8, u8, u8), (u8, u8, u8)> = HashMap::new();
+    let clusters_created = clusters.len();
 
-    for (rgb, _) in img.pixels().map(|p| ((p[0], p[1], p[2]), p[3])).filter(|(_, a)| *a > 0) {
-        if color_map.contains_key(&rgb) {
-            continue;
-        }
-
-        let lab = rgb_to_lab(rgb.0, rgb.1, rgb.2);
-
-        // Find nearest cluster
-        let mut nearest_cluster = &clusters[0];
-        let mut min_distance = delta_e76(lab, nearest_cluster.lab);
-
-        for cluster in &clusters[1..] {
-            let distance = delta_e76(lab, cluster.lab);
-            if distance < min_distance {
-                min_distance = distance;
-                nearest_cluster = cluster;
-            }
-        }
-
-        // Convert cluster LAB back to RGB
-        let new_rgb = lab_to_rgb(nearest_cluster.lab.0, nearest_cluster.lab.1, nearest_cluster.lab.2);
-        color_map.insert(rgb, new_rgb);
-    }
-
-    // Apply color mapping to image
-    for pixel in img.pixels_mut() {
-        if pixel[3] > 0 {
-            let rgb = (pixel[0], pixel[1], pixel[2]);
-            if let Some(&new_rgb) = color_map.get(&rgb) {
-                pixel[0] = new_rgb.0;
-                pixel[1] = new_rgb.1;
-                pixel[2] = new_rgb.2;
-            }
+    // Build color mapping (Python lines 135-139)
+    let mut colormap: HashMap<(u8, u8, u8), (u8, u8, u8)> = HashMap::new();
+    for cluster in &clusters {
+        let rep = lab_to_rgb(cluster.center_lab.0, cluster.center_lab.1, cluster.center_lab.2);
+        for &(rgb, _) in &cluster.members {
+            colormap.insert(rgb, rep);
         }
     }
-}
 
-/// Generate outlines around sprites
-fn generate_outline(img: &mut RgbaImage, settings: &ProcessorSettings) {
-    let (width, height) = img.dimensions();
-    let mut outline_mask = ImageBuffer::from_pixel(width, height, Rgba([0u8, 0, 0, 0]));
+    let unique_after = colormap.values().collect::<std::collections::HashSet<_>>().len();
 
-    // Find edge pixels
+    // Apply color mapping (Python lines 142-149)
     for y in 0..height {
         for x in 0..width {
-            let pixel = img.get_pixel(x, y);
-
-            // Skip if already transparent
-            if pixel[3] <= settings.edge_transparent_cutoff {
-                continue;
-            }
-
-            // Check neighbors based on connectivity
-            let neighbors = match settings.outline_connectivity {
-                Connectivity::Four => vec![
-                    (x.wrapping_sub(1), y),
-                    (x + 1, y),
-                    (x, y.wrapping_sub(1)),
-                    (x, y + 1),
-                ],
-                Connectivity::Eight => vec![
-                    (x.wrapping_sub(1), y),
-                    (x + 1, y),
-                    (x, y.wrapping_sub(1)),
-                    (x, y + 1),
-                    (x.wrapping_sub(1), y.wrapping_sub(1)),
-                    (x + 1, y.wrapping_sub(1)),
-                    (x.wrapping_sub(1), y + 1),
-                    (x + 1, y + 1),
-                ],
-            };
-
-            // Check if any neighbor is transparent (edge pixel)
-            let is_edge = neighbors.iter().any(|&(nx, ny)| {
-                if nx < width && ny < height {
-                    img.get_pixel(nx, ny)[3] <= settings.edge_transparent_cutoff
-                } else {
-                    true // Treat out-of-bounds as transparent
+            let pixel = img.get_pixel_mut(x, y);
+            if pixel[3] >= 1 {
+                let key = (pixel[0], pixel[1], pixel[2]);
+                if let Some(&(r, g, b)) = colormap.get(&key) {
+                    pixel[0] = r;
+                    pixel[1] = g;
+                    pixel[2] = b;
                 }
-            });
-
-            if is_edge {
-                outline_mask.put_pixel(x, y, Rgba([255, 255, 255, 255]));
             }
         }
     }
 
-    // Grow outline inward by thickness
-    for _ in 1..settings.outline_thickness {
-        let mut new_mask = outline_mask.clone();
+    (unique_before, unique_after, clusters_created)
+}
 
-        for y in 0..height {
-            for x in 0..width {
-                if outline_mask.get_pixel(x, y)[0] > 0 {
-                    // Already marked, dilate
-                    let neighbors = vec![
-                        (x.wrapping_sub(1), y),
-                        (x + 1, y),
-                        (x, y.wrapping_sub(1)),
-                        (x, y + 1),
-                    ];
+// ============================================================================
+// STEP 3: OUTLINE GENERATION
+// Exact match to Python lines 151-202 (frontier queue, grows inward)
+// ============================================================================
 
-                    for (nx, ny) in neighbors {
-                        if nx < width && ny < height {
-                            let orig_pixel = img.get_pixel(nx, ny);
-                            if orig_pixel[3] > settings.edge_transparent_cutoff {
-                                new_mask.put_pixel(nx, ny, Rgba([255, 255, 255, 255]));
-                            }
-                        }
+fn get_neighbors(x: u32, y: u32, width: u32, height: u32, connectivity: &Connectivity) -> Vec<(u32, u32)> {
+    let mut neighbors = Vec::new();
+
+    match connectivity {
+        Connectivity::Four => {
+            // Python lines 165-169
+            if x > 0 { neighbors.push((x - 1, y)); }
+            if x < width - 1 { neighbors.push((x + 1, y)); }
+            if y > 0 { neighbors.push((x, y - 1)); }
+            if y < height - 1 { neighbors.push((x, y + 1)); }
+        }
+        Connectivity::Eight => {
+            // Python lines 170-174
+            for nx in x.saturating_sub(1)..=(x + 1).min(width - 1) {
+                for ny in y.saturating_sub(1)..=(y + 1).min(height - 1) {
+                    if !(nx == x && ny == y) {
+                        neighbors.push((nx, ny));
                     }
                 }
             }
         }
-
-        outline_mask = new_mask;
     }
 
-    // Apply outline color
+    neighbors
+}
+
+fn generate_outline(img: &mut RgbaImage, settings: &ProcessorSettings) {
+    let (width, height) = img.dimensions();
+    let edge_cutoff = settings.edge_transparent_cutoff;
+    let connectivity = &settings.outline_connectivity;
+    let thickness = settings.outline_thickness;
+
+    // Extract alpha channel (Python line 158)
+    let alpha: Vec<Vec<u8>> = (0..height)
+        .map(|y| (0..width).map(|x| img.get_pixel(x, y)[3]).collect())
+        .collect();
+
+    // Build outline mask (Python line 161)
+    let mut mask: Vec<Vec<bool>> = vec![vec![false; width as usize]; height as usize];
+
+    // Find border pixels (Python lines 177-186)
+    let mut frontier: Vec<(u32, u32)> = Vec::new();
+
+    for y in 0..height {
+        for x in 0..width {
+            if alpha[y as usize][x as usize] > edge_cutoff {
+                let is_border = get_neighbors(x, y, width, height, connectivity)
+                    .iter()
+                    .any(|&(nx, ny)| alpha[ny as usize][nx as usize] <= edge_cutoff);
+
+                if is_border {
+                    mask[y as usize][x as usize] = true;
+                    frontier.push((x, y));
+                }
+            }
+        }
+    }
+
+    // Grow inward for thickness (Python lines 189-196)
+    for _ in 1..thickness {
+        let mut new_frontier: Vec<(u32, u32)> = Vec::new();
+
+        for &(x, y) in &frontier {
+            for (nx, ny) in get_neighbors(x, y, width, height, connectivity) {
+                if alpha[ny as usize][nx as usize] > edge_cutoff
+                    && !mask[ny as usize][nx as usize]
+                {
+                    mask[ny as usize][nx as usize] = true;
+                    new_frontier.push((nx, ny));
+                }
+            }
+        }
+
+        frontier = new_frontier;
+    }
+
+    // Apply outline color (Python lines 199-202)
     let outline_rgba = Rgba([
         settings.outline_color.0,
         settings.outline_color.1,
@@ -372,45 +411,63 @@ fn generate_outline(img: &mut RgbaImage, settings: &ProcessorSettings) {
 
     for y in 0..height {
         for x in 0..width {
-            if outline_mask.get_pixel(x, y)[0] > 0 {
+            if mask[y as usize][x as usize] {
                 img.put_pixel(x, y, outline_rgba);
             }
         }
     }
 }
 
-/// Process a single image with the given settings
+// ============================================================================
+// MAIN ENTRY POINT
+// ============================================================================
+
 pub fn process_image(
     input_path: PathBuf,
     output_path: PathBuf,
     settings: ProcessorSettings,
-) -> Result<()> {
+) -> Result<ProcessorResult> {
     // Load image
     let img = image::open(&input_path)
         .map_err(|e| PixelsError::Processing(format!("Failed to load {}: {}", input_path.display(), e)))?;
 
     let mut rgba = img.to_rgba8();
+    let original_size = rgba.dimensions();
 
-    // Apply processing steps in order
-
-    // 1. Normalize opacity
+    // Step 1: Opacity normalization (always runs)
     normalize_opacity(&mut rgba, &settings);
 
-    // 2. Simplify colors (if enabled)
-    if settings.enable_color_simplify {
-        simplify_colors(&mut rgba, settings.lab_merge_threshold);
+    // Step 2: Color simplification (if enabled)
+    let (colors_before, colors_after, clusters) = if settings.enable_color_simplify {
+        simplify_colors(&mut rgba, settings.lab_merge_threshold)
+    } else {
+        (0, 0, 0)
+    };
+
+    // Step 3: Outline generation (if enabled and thickness > 0)
+    if settings.enable_outline && settings.outline_thickness > 0 {
+        generate_outline(&mut rgba, &settings);
     }
 
-    // 3. Generate outline (if enabled)
-    if settings.enable_outline {
-        generate_outline(&mut rgba, &settings);
+    // Ensure output directory exists
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
 
     // Save result
     rgba.save(&output_path)?;
 
-    Ok(())
+    Ok(ProcessorResult {
+        original_size,
+        unique_colors_before: colors_before,
+        unique_colors_after: colors_after,
+        clusters_created: clusters,
+    })
 }
+
+// ============================================================================
+// TESTS
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -418,23 +475,44 @@ mod tests {
 
     #[test]
     fn test_rgb_lab_roundtrip() {
-        let (r, g, b) = (128, 64, 200);
-        let lab = rgb_to_lab(r, g, b);
-        let (r2, g2, b2) = lab_to_rgb(lab.0, lab.1, lab.2);
+        let test_colors = [
+            (255, 0, 0), (0, 255, 0), (0, 0, 255),
+            (255, 255, 255), (0, 0, 0), (128, 128, 128),
+            (17, 6, 2), // Default outline color
+        ];
 
-        // Allow small rounding errors
-        assert!((r as i16 - r2 as i16).abs() <= 2);
-        assert!((g as i16 - g2 as i16).abs() <= 2);
-        assert!((b as i16 - b2 as i16).abs() <= 2);
+        for (r, g, b) in test_colors {
+            let lab = rgb_to_lab(r, g, b);
+            let (r2, g2, b2) = lab_to_rgb(lab.0, lab.1, lab.2);
+            assert!((r as i16 - r2 as i16).abs() <= 1, "Red mismatch for ({}, {}, {})", r, g, b);
+            assert!((g as i16 - g2 as i16).abs() <= 1, "Green mismatch for ({}, {}, {})", r, g, b);
+            assert!((b as i16 - b2 as i16).abs() <= 1, "Blue mismatch for ({}, {}, {})", r, g, b);
+        }
     }
 
     #[test]
-    fn test_delta_e76() {
-        let lab1 = (50.0, 25.0, -10.0);
-        let lab2 = (50.0, 25.0, -10.0);
-        assert_eq!(delta_e76(lab1, lab2), 0.0);
+    fn test_delta_e76_same_color() {
+        let lab = rgb_to_lab(100, 100, 100);
+        assert!(delta_e76(lab, lab) < 0.001);
+    }
 
-        let lab3 = (60.0, 25.0, -10.0);
-        assert!(delta_e76(lab1, lab3) > 0.0);
+    #[test]
+    fn test_neighbors_4way() {
+        let neighbors = get_neighbors(5, 5, 10, 10, &Connectivity::Four);
+        assert_eq!(neighbors.len(), 4);
+    }
+
+    #[test]
+    fn test_neighbors_8way() {
+        let neighbors = get_neighbors(5, 5, 10, 10, &Connectivity::Eight);
+        assert_eq!(neighbors.len(), 8);
+    }
+
+    #[test]
+    fn test_neighbors_corner() {
+        let n4 = get_neighbors(0, 0, 10, 10, &Connectivity::Four);
+        assert_eq!(n4.len(), 2);
+        let n8 = get_neighbors(0, 0, 10, 10, &Connectivity::Eight);
+        assert_eq!(n8.len(), 3);
     }
 }

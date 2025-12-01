@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use tauri::Manager;
 use error::Result;
 use packer::{PackerSettings, PackerResult};
-use processor::ProcessorSettings;
+use processor::{ProcessorSettings, ProcessorResult};
 use downscaler::{DownscalerSettings, DownscaleResult};
 use db::{Database, Project, ProjectSettings};
 
@@ -34,7 +34,7 @@ async fn process_image_command(
     input_path: String,
     output_path: String,
     settings: ProcessorSettings,
-) -> Result<()> {
+) -> Result<ProcessorResult> {
     let input = PathBuf::from(input_path);
     let output = PathBuf::from(output_path);
 

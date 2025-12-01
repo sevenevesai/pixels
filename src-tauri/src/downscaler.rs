@@ -1,3 +1,9 @@
+//! AI Pixel Art Downscaler
+//!
+//! Detects the true pixel grid in AI-generated pixel art and downscales
+//! to the actual resolution. Uses FFT for grid detection and block variance
+//! with phase search for optimal alignment.
+
 use image::{RgbaImage, Rgba, ImageBuffer};
 use rustfft::{FftPlanner, num_complex::Complex};
 use serde::{Deserialize, Serialize};
@@ -6,36 +12,18 @@ use crate::error::{Result, PixelsError};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownscalerSettings {
-    pub bg_removal_mode: BgRemovalMode,
-    pub bg_tolerance: u8,
-    pub bg_edge_tolerance: u8,
-    pub preserve_dark_lines: bool,
-    pub dark_line_threshold: u16,
+    /// Auto-trim transparent borders before processing
     pub auto_trim: bool,
-    pub enable_fine_tune: bool,
+    /// Pad output canvas to a multiple of this value (0 = disabled)
     pub pad_canvas: bool,
     pub canvas_multiple: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BgRemovalMode {
-    Conservative,
-    Aggressive,
-    None,
 }
 
 impl Default for DownscalerSettings {
     fn default() -> Self {
         Self {
-            bg_removal_mode: BgRemovalMode::Conservative,
-            bg_tolerance: 15,
-            bg_edge_tolerance: 30,
-            preserve_dark_lines: true,
-            dark_line_threshold: 100,
             auto_trim: true,
-            enable_fine_tune: true,
-            pad_canvas: true,
+            pad_canvas: false,
             canvas_multiple: 16,
         }
     }
@@ -396,286 +384,6 @@ fn downsample_with_phase(img: &RgbaImage, scale: u32, phase_x: u32, phase_y: u32
 }
 
 // ============================================================================
-// BACKGROUND REMOVAL
-// ============================================================================
-
-/// Public wrapper for testing
-pub fn remove_background_public(img: &mut RgbaImage, settings: &DownscalerSettings) {
-    remove_background(img, settings);
-}
-
-/// Sample RGB colors from canvas edges
-fn sample_edge_colors(img: &RgbaImage, sample_width: u32) -> Vec<[u8; 3]> {
-    let (width, height) = img.dimensions();
-    let mut colors = Vec::new();
-
-    // Top edge
-    for y in 0..sample_width.min(height) {
-        for x in 0..width {
-            let pixel = img.get_pixel(x, y);
-            colors.push([pixel[0], pixel[1], pixel[2]]);
-        }
-    }
-
-    // Bottom edge
-    for y in (height.saturating_sub(sample_width))..height {
-        for x in 0..width {
-            let pixel = img.get_pixel(x, y);
-            colors.push([pixel[0], pixel[1], pixel[2]]);
-        }
-    }
-
-    // Left edge
-    for y in 0..height {
-        for x in 0..sample_width.min(width) {
-            let pixel = img.get_pixel(x, y);
-            colors.push([pixel[0], pixel[1], pixel[2]]);
-        }
-    }
-
-    // Right edge
-    for y in 0..height {
-        for x in (width.saturating_sub(sample_width))..width {
-            let pixel = img.get_pixel(x, y);
-            colors.push([pixel[0], pixel[1], pixel[2]]);
-        }
-    }
-
-    colors
-}
-
-/// Find most common background colors
-fn find_background_colors(edge_colors: &[[u8; 3]], max_colors: usize) -> Vec<[u8; 3]> {
-    use std::collections::HashMap;
-
-    let mut color_counts: HashMap<[u8; 3], usize> = HashMap::new();
-    for color in edge_colors {
-        let rounded = [
-            (color[0] / 16) * 16,
-            (color[1] / 16) * 16,
-            (color[2] / 16) * 16,
-        ];
-        *color_counts.entry(rounded).or_insert(0) += 1;
-    }
-
-    let mut counts: Vec<_> = color_counts.into_iter().collect();
-    counts.sort_by(|a, b| b.1.cmp(&a.1));
-    counts.into_iter().take(max_colors).map(|(c, _)| c).collect()
-}
-
-/// RGB color distance (sum of absolute differences)
-fn rgb_color_distance(c1: &[u8; 3], c2: &[u8; 3]) -> i32 {
-    (c1[0] as i32 - c2[0] as i32).abs() +
-    (c1[1] as i32 - c2[1] as i32).abs() +
-    (c1[2] as i32 - c2[2] as i32).abs()
-}
-
-/// Check if edge pixel is likely content
-fn is_content_edge(img: &RgbaImage, x: u32, y: u32, window_size: u32) -> bool {
-    let (width, height) = img.dimensions();
-
-    let x_start = x.saturating_sub(window_size);
-    let x_end = (x + window_size + 1).min(width);
-    let y_start = y.saturating_sub(window_size);
-    let y_end = (y + window_size + 1).min(height);
-
-    let mut rgb_values: Vec<[u8; 3]> = Vec::new();
-    for ny in y_start..y_end {
-        for nx in x_start..x_end {
-            let pixel = img.get_pixel(nx, ny);
-            rgb_values.push([pixel[0], pixel[1], pixel[2]]);
-        }
-    }
-
-    if rgb_values.is_empty() {
-        return false;
-    }
-
-    let mean: [f32; 3] = [
-        rgb_values.iter().map(|p| p[0] as f32).sum::<f32>() / rgb_values.len() as f32,
-        rgb_values.iter().map(|p| p[1] as f32).sum::<f32>() / rgb_values.len() as f32,
-        rgb_values.iter().map(|p| p[2] as f32).sum::<f32>() / rgb_values.len() as f32,
-    ];
-
-    let variance: f32 = rgb_values.iter().map(|p| {
-        let diff = [
-            p[0] as f32 - mean[0],
-            p[1] as f32 - mean[1],
-            p[2] as f32 - mean[2],
-        ];
-        diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2]
-    }).sum::<f32>() / rgb_values.len() as f32;
-
-    let min_vals = [
-        rgb_values.iter().map(|p| p[0]).min().unwrap(),
-        rgb_values.iter().map(|p| p[1]).min().unwrap(),
-        rgb_values.iter().map(|p| p[2]).min().unwrap(),
-    ];
-    let max_vals = [
-        rgb_values.iter().map(|p| p[0]).max().unwrap(),
-        rgb_values.iter().map(|p| p[1]).max().unwrap(),
-        rgb_values.iter().map(|p| p[2]).max().unwrap(),
-    ];
-    let color_range = (max_vals[0] - min_vals[0]) as i32 +
-                      (max_vals[1] - min_vals[1]) as i32 +
-                      (max_vals[2] - min_vals[2]) as i32;
-
-    variance > 100.0 || color_range > 50
-}
-
-/// Remove background using flood fill from edges
-fn remove_background(img: &mut RgbaImage, settings: &DownscalerSettings) {
-    if matches!(settings.bg_removal_mode, BgRemovalMode::None) {
-        return;
-    }
-
-    let (width, height) = img.dimensions();
-    let tolerance = settings.bg_tolerance as i32;
-    let edge_tolerance = settings.bg_edge_tolerance as i32;
-
-    let edge_colors = sample_edge_colors(img, 5);
-    let bg_colors = find_background_colors(&edge_colors, 3);
-
-    if bg_colors.is_empty() {
-        return;
-    }
-
-    // Detect content edges in conservative mode
-    let mut content_edge_mask = vec![vec![false; width as usize]; height as usize];
-    if matches!(settings.bg_removal_mode, BgRemovalMode::Conservative) {
-        let edge_width = 10u32;
-        for y in 0..height {
-            for x in 0..width {
-                if x < edge_width || x >= width - edge_width ||
-                   y < edge_width || y >= height - edge_width {
-                    if is_content_edge(img, x, y, 3) {
-                        content_edge_mask[y as usize][x as usize] = true;
-                    }
-                }
-            }
-        }
-    }
-
-    // Create background mask
-    let mut mask = vec![vec![false; width as usize]; height as usize];
-    let edge_zone = 10u32;
-
-    for y in 0..height {
-        for x in 0..width {
-            let pixel = img.get_pixel(x, y);
-            let rgb = [pixel[0], pixel[1], pixel[2]];
-
-            let in_edge_zone = x < edge_zone || x >= width - edge_zone ||
-                               y < edge_zone || y >= height - edge_zone;
-
-            let threshold = if in_edge_zone { edge_tolerance } else { tolerance };
-
-            for bg_color in &bg_colors {
-                if rgb_color_distance(&rgb, bg_color) <= threshold {
-                    mask[y as usize][x as usize] = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    // Protect content edges
-    if matches!(settings.bg_removal_mode, BgRemovalMode::Conservative) {
-        for y in 0..height {
-            for x in 0..width {
-                if content_edge_mask[y as usize][x as usize] {
-                    mask[y as usize][x as usize] = false;
-                }
-            }
-        }
-    }
-
-    // Binary dilation of mask
-    let dilation_iterations = if matches!(settings.bg_removal_mode, BgRemovalMode::Conservative) { 1 } else { 2 };
-    let mut mask_dilated = mask.clone();
-    for _ in 0..dilation_iterations {
-        let mut new_mask = mask_dilated.clone();
-        for y in 0..height as usize {
-            for x in 0..width as usize {
-                if mask_dilated[y][x] {
-                    if y > 0 { new_mask[y - 1][x] = true; }
-                    if y < height as usize - 1 { new_mask[y + 1][x] = true; }
-                    if x > 0 { new_mask[y][x - 1] = true; }
-                    if x < width as usize - 1 { new_mask[y][x + 1] = true; }
-                }
-            }
-        }
-        mask_dilated = new_mask;
-    }
-
-    // Create edge seed
-    let mut edge_seed = vec![vec![false; width as usize]; height as usize];
-    for x in 0..width as usize {
-        if mask_dilated[0][x] { edge_seed[0][x] = true; }
-        if mask_dilated[height as usize - 1][x] { edge_seed[height as usize - 1][x] = true; }
-    }
-    for y in 0..height as usize {
-        if mask_dilated[y][0] { edge_seed[y][0] = true; }
-        if mask_dilated[y][width as usize - 1] { edge_seed[y][width as usize - 1] = true; }
-    }
-
-    // Flood fill
-    let mut flooded = edge_seed.clone();
-    let max_iterations = 500;
-
-    for _ in 0..max_iterations {
-        let mut new_flooded = flooded.clone();
-        let mut changed = false;
-
-        for y in 0..height as usize {
-            for x in 0..width as usize {
-                if flooded[y][x] {
-                    let neighbors = [(0i32, -1i32), (0i32, 1i32), (-1i32, 0i32), (1i32, 0i32)];
-                    for (dx, dy) in neighbors {
-                        let nx = x as i32 + dx;
-                        let ny = y as i32 + dy;
-
-                        if nx >= 0 && nx < width as i32 && ny >= 0 && ny < height as i32 {
-                            let nx = nx as usize;
-                            let ny = ny as usize;
-
-                            if mask_dilated[ny][nx] && !flooded[ny][nx] {
-                                new_flooded[ny][nx] = true;
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !changed {
-            break;
-        }
-
-        flooded = new_flooded;
-    }
-
-    // Apply flood fill result
-    for y in 0..height {
-        for x in 0..width {
-            if flooded[y as usize][x as usize] {
-                let pixel = img.get_pixel(x, y);
-
-                if settings.preserve_dark_lines {
-                    let sum = pixel[0] as u16 + pixel[1] as u16 + pixel[2] as u16;
-                    if sum < settings.dark_line_threshold {
-                        continue;
-                    }
-                }
-
-                img.put_pixel(x, y, Rgba([pixel[0], pixel[1], pixel[2], 0]));
-            }
-        }
-    }
-}
-
-// ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 
@@ -747,29 +455,31 @@ pub fn downscale_image(
     let mut rgba = img.to_rgba8();
     let original_size = rgba.dimensions();
 
-    // Step 1: Remove background
-    remove_background(&mut rgba, &settings);
-
-    // Step 2: Auto trim before scale detection (important for accurate FFT)
+    // Step 1: Auto trim before scale detection (important for accurate FFT)
     if settings.auto_trim {
         rgba = auto_trim(&rgba);
     }
 
-    // Step 3: Detect grid size using FFT
+    // Step 2: Detect grid size using FFT
     let grid_hint = detect_grid_size(&rgba);
 
-    // Step 4: Find optimal scale and phase using v4 algorithm
+    // Step 3: Find optimal scale and phase using v4 algorithm
     let (scale, phase_x, phase_y) = find_optimal_scale_v4(&rgba, grid_hint);
 
-    // Step 5: Downsample with phase-aware sampling
+    // Step 4: Downsample with phase-aware sampling
     let scale_factor = scale as f32;
     if scale > 1 {
         rgba = downsample_with_phase(&rgba, scale, phase_x, phase_y);
     }
 
-    // Step 6: Pad canvas if enabled
+    // Step 5: Pad canvas if enabled
     if settings.pad_canvas {
         rgba = pad_to_multiple(&rgba, settings.canvas_multiple);
+    }
+
+    // Ensure output directory exists
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
 
     // Save result
