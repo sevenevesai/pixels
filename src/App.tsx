@@ -3,6 +3,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readDir, exists, readFile } from "@tauri-apps/plugin-fs";
 import "./App.css";
+import { Workspace } from "./components/v2";
+
+// Toggle this to switch between v1 and v2 UI
+const USE_V2_UI = true;
 
 interface Project {
   id: number;
@@ -20,6 +24,16 @@ interface ImageFile {
 type TabType = "downscale" | "process" | "pack";
 
 function App() {
+  // V2 UI - unified workspace
+  if (USE_V2_UI) {
+    return <Workspace />;
+  }
+
+  // V1 UI - tab-based (legacy)
+  return <AppV1 />;
+}
+
+function AppV1() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [currentProjectId, setCurrentProjectId] = useState<number | null>(null);
   const [activeTab, setActiveTab] = useState<TabType>("downscale");

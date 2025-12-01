@@ -35,6 +35,8 @@ thiserror = "2"
 anyhow = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 palette = "0.7"
+sha2 = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
 
 # Optimize dev builds for better performance
 [profile.dev]

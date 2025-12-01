@@ -4,10 +4,20 @@
 //! 1. Opacity Normalization - Quantize alpha to 0 or 255
 //! 2. Color Simplification - LAB color space clustering to merge similar colors
 //! 3. Outline Generation - Add outline/border around sprites (grows inward)
+//!
+//! ## V2 Architecture
+//!
+//! Each operation is now exposed as a standalone public function that operates
+//! on in-memory `RgbaImage` data. This enables:
+//! - Selective application (e.g., just outline, no color merge)
+//! - Iterative processing (apply operations multiple times)
+//! - Live preview generation without file I/O
+//!
+//! The original `process_image` function remains for backward compatibility.
 
 use image::{RgbaImage, Rgba};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use crate::error::{Result, PixelsError};
 
@@ -44,6 +54,89 @@ pub struct ProcessorSettings {
 pub enum Connectivity {
     Four,
     Eight,
+}
+
+// ============================================================================
+// INDIVIDUAL OPERATION SETTINGS (V2)
+// ============================================================================
+
+/// Settings for alpha/opacity normalization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlphaSettings {
+    /// Alpha threshold below which pixels become fully transparent (default: 200)
+    pub low_cutoff: u8,
+    /// Lower bound of range for making pixels fully opaque (default: 200)
+    pub high_min: u8,
+    /// Upper bound of range for making pixels fully opaque (default: 255)
+    pub high_max: u8,
+}
+
+impl Default for AlphaSettings {
+    fn default() -> Self {
+        Self {
+            low_cutoff: 200,
+            high_min: 200,
+            high_max: 255,
+        }
+    }
+}
+
+/// Settings for LAB color space merging
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeSettings {
+    /// Delta E76 threshold for color clustering - lower = more aggressive merging (default: 3.0)
+    pub threshold: f32,
+}
+
+impl Default for MergeSettings {
+    fn default() -> Self {
+        Self { threshold: 3.0 }
+    }
+}
+
+/// Settings for outline generation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutlineSettings {
+    /// Outline color as RGBA tuple (default: (17, 6, 2, 255) - dark brown)
+    pub color: (u8, u8, u8, u8),
+    /// Neighbor connectivity: "four" or "eight" (default: four)
+    pub connectivity: Connectivity,
+    /// Outline thickness in pixels to grow inward (default: 1)
+    pub thickness: u32,
+    /// Alpha threshold for edge detection - pixels <= this are transparent (default: 0)
+    pub edge_transparent_cutoff: u8,
+}
+
+impl Default for OutlineSettings {
+    fn default() -> Self {
+        Self {
+            color: (17, 6, 2, 255),
+            connectivity: Connectivity::Four,
+            thickness: 1,
+            edge_transparent_cutoff: 0,
+        }
+    }
+}
+
+/// Result from color merge operation
+#[derive(Debug, Clone, Serialize)]
+pub struct MergeResult {
+    pub unique_colors_before: usize,
+    pub unique_colors_after: usize,
+    pub clusters_created: usize,
+}
+
+/// Result from outline detection
+#[derive(Debug, Clone, Serialize)]
+pub struct OutlineDetectionResult {
+    /// Whether an existing outline was detected
+    pub has_outline: bool,
+    /// The detected outline color (if any)
+    pub outline_color: Option<(u8, u8, u8, u8)>,
+    /// Confidence score (0.0 - 1.0) - percentage of edge pixels matching detected color
+    pub confidence: f32,
+    /// Number of edge pixels analyzed
+    pub edge_pixel_count: usize,
 }
 
 impl Default for ProcessorSettings {
@@ -186,7 +279,8 @@ fn delta_e76(lab1: (f32, f32, f32), lab2: (f32, f32, f32)) -> f32 {
 // Exact match to Python lines 77-89
 // ============================================================================
 
-fn normalize_opacity(img: &mut RgbaImage, settings: &ProcessorSettings) {
+/// Internal function using legacy ProcessorSettings
+fn normalize_opacity_internal(img: &mut RgbaImage, settings: &ProcessorSettings) {
     let (width, height) = img.dimensions();
 
     for y in 0..height {
@@ -197,6 +291,30 @@ fn normalize_opacity(img: &mut RgbaImage, settings: &ProcessorSettings) {
             if alpha < settings.alpha_low_cutoff {
                 pixel[3] = 0;
             } else if alpha >= settings.alpha_high_min && alpha <= settings.alpha_high_max {
+                pixel[3] = 255;
+            }
+        }
+    }
+}
+
+/// Normalize alpha channel to binary (0 or 255)
+///
+/// This operation quantizes semi-transparent pixels:
+/// - Alpha < low_cutoff → 0 (fully transparent)
+/// - Alpha >= high_min and <= high_max → 255 (fully opaque)
+///
+/// Safe to re-apply: idempotent operation (no change on second application)
+pub fn normalize_alpha(img: &mut RgbaImage, settings: &AlphaSettings) {
+    let (width, height) = img.dimensions();
+
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = img.get_pixel_mut(x, y);
+            let alpha = pixel[3];
+
+            if alpha < settings.low_cutoff {
+                pixel[3] = 0;
+            } else if alpha >= settings.high_min && alpha <= settings.high_max {
                 pixel[3] = 255;
             }
         }
@@ -245,7 +363,14 @@ impl LabCluster {
     }
 }
 
-fn simplify_colors(img: &mut RgbaImage, threshold: f32) -> (usize, usize, usize) {
+/// Internal color simplification (returns tuple for legacy API)
+fn simplify_colors_internal(img: &mut RgbaImage, threshold: f32) -> (usize, usize, usize) {
+    let result = merge_colors_impl(img, threshold);
+    (result.unique_colors_before, result.unique_colors_after, result.clusters_created)
+}
+
+/// Core implementation of LAB color clustering
+fn merge_colors_impl(img: &mut RgbaImage, threshold: f32) -> MergeResult {
     let (width, height) = img.dimensions();
 
     // Collect unique colors with counts (Python lines 96-102)
@@ -262,7 +387,11 @@ fn simplify_colors(img: &mut RgbaImage, threshold: f32) -> (usize, usize, usize)
 
     let unique_before = color_counts.len();
     if color_counts.is_empty() {
-        return (0, 0, 0);
+        return MergeResult {
+            unique_colors_before: 0,
+            unique_colors_after: 0,
+            clusters_created: 0,
+        };
     }
 
     // Sort by frequency descending (Python line 107)
@@ -300,7 +429,7 @@ fn simplify_colors(img: &mut RgbaImage, threshold: f32) -> (usize, usize, usize)
         }
     }
 
-    let unique_after = colormap.values().collect::<std::collections::HashSet<_>>().len();
+    let unique_after = colormap.values().collect::<HashSet<_>>().len();
 
     // Apply color mapping (Python lines 142-149)
     for y in 0..height {
@@ -317,7 +446,21 @@ fn simplify_colors(img: &mut RgbaImage, threshold: f32) -> (usize, usize, usize)
         }
     }
 
-    (unique_before, unique_after, clusters_created)
+    MergeResult {
+        unique_colors_before: unique_before,
+        unique_colors_after: unique_after,
+        clusters_created,
+    }
+}
+
+/// Merge similar colors using LAB color space clustering
+///
+/// Uses greedy first-fit assignment with Delta E76 distance metric.
+/// Colors within `threshold` distance are merged to their weighted average.
+///
+/// Safe to re-apply: progressive simplification (may reduce colors further each time)
+pub fn merge_colors(img: &mut RgbaImage, settings: &MergeSettings) -> MergeResult {
+    merge_colors_impl(img, settings.threshold)
 }
 
 // ============================================================================
@@ -351,11 +494,35 @@ fn get_neighbors(x: u32, y: u32, width: u32, height: u32, connectivity: &Connect
     neighbors
 }
 
-fn generate_outline(img: &mut RgbaImage, settings: &ProcessorSettings) {
+/// Internal function using legacy ProcessorSettings
+fn generate_outline_internal(img: &mut RgbaImage, settings: &ProcessorSettings) {
+    let outline_settings = OutlineSettings {
+        color: settings.outline_color,
+        connectivity: settings.outline_connectivity.clone(),
+        thickness: settings.outline_thickness,
+        edge_transparent_cutoff: settings.edge_transparent_cutoff,
+    };
+    add_outline(img, &outline_settings);
+}
+
+/// Add outline/border around sprite (grows inward from edges)
+///
+/// Uses frontier queue algorithm:
+/// 1. Find all border pixels (opaque pixels adjacent to transparent)
+/// 2. Grow inward for `thickness` iterations
+/// 3. Apply outline color to all pixels in the mask
+///
+/// **Warning**: Applying outline to an already-outlined image creates double-outline artifacts.
+/// Use `detect_outline()` first to check if image already has an outline.
+pub fn add_outline(img: &mut RgbaImage, settings: &OutlineSettings) {
     let (width, height) = img.dimensions();
     let edge_cutoff = settings.edge_transparent_cutoff;
-    let connectivity = &settings.outline_connectivity;
-    let thickness = settings.outline_thickness;
+    let connectivity = &settings.connectivity;
+    let thickness = settings.thickness;
+
+    if thickness == 0 {
+        return;
+    }
 
     // Extract alpha channel (Python line 158)
     let alpha: Vec<Vec<u8>> = (0..height)
@@ -403,10 +570,10 @@ fn generate_outline(img: &mut RgbaImage, settings: &ProcessorSettings) {
 
     // Apply outline color (Python lines 199-202)
     let outline_rgba = Rgba([
-        settings.outline_color.0,
-        settings.outline_color.1,
-        settings.outline_color.2,
-        settings.outline_color.3,
+        settings.color.0,
+        settings.color.1,
+        settings.color.2,
+        settings.color.3,
     ]);
 
     for y in 0..height {
@@ -419,9 +586,120 @@ fn generate_outline(img: &mut RgbaImage, settings: &ProcessorSettings) {
 }
 
 // ============================================================================
+// OUTLINE DETECTION (V2)
+// ============================================================================
+
+/// Detect if an image already has an outline
+///
+/// Scans edge pixels (opaque pixels adjacent to transparent) and checks
+/// if they form a uniform or near-uniform color pattern, which indicates
+/// an existing outline.
+///
+/// Returns detection result with confidence score. Use this before `add_outline`
+/// to warn users about potential double-outline artifacts.
+pub fn detect_outline(img: &RgbaImage) -> OutlineDetectionResult {
+    let (width, height) = img.dimensions();
+
+    if width == 0 || height == 0 {
+        return OutlineDetectionResult {
+            has_outline: false,
+            outline_color: None,
+            confidence: 0.0,
+            edge_pixel_count: 0,
+        };
+    }
+
+    // Collect edge pixels (opaque pixels adjacent to transparent)
+    let mut edge_colors: Vec<(u8, u8, u8, u8)> = Vec::new();
+
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = img.get_pixel(x, y);
+
+            // Only consider opaque pixels
+            if pixel[3] > 0 {
+                // Check if adjacent to any transparent pixel (4-connectivity)
+                let is_edge = [
+                    (x.wrapping_sub(1), y),
+                    (x + 1, y),
+                    (x, y.wrapping_sub(1)),
+                    (x, y + 1),
+                ]
+                .iter()
+                .any(|&(nx, ny)| {
+                    if nx < width && ny < height {
+                        img.get_pixel(nx, ny)[3] == 0
+                    } else {
+                        true // Image boundary counts as transparent
+                    }
+                });
+
+                if is_edge {
+                    edge_colors.push((pixel[0], pixel[1], pixel[2], pixel[3]));
+                }
+            }
+        }
+    }
+
+    let edge_count = edge_colors.len();
+
+    if edge_count == 0 {
+        return OutlineDetectionResult {
+            has_outline: false,
+            outline_color: None,
+            confidence: 0.0,
+            edge_pixel_count: 0,
+        };
+    }
+
+    // Count color occurrences
+    let mut color_counts: HashMap<(u8, u8, u8, u8), usize> = HashMap::new();
+    for color in &edge_colors {
+        *color_counts.entry(*color).or_insert(0) += 1;
+    }
+
+    // Find most common edge color
+    let (most_common_color, most_common_count) = color_counts
+        .iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(color, count)| (*color, *count))
+        .unwrap();
+
+    // Calculate confidence: what percentage of edge pixels match the most common color?
+    let confidence = most_common_count as f32 / edge_count as f32;
+
+    // Also count colors within small Delta E distance (allow slight variations)
+    let most_common_lab = rgb_to_lab(most_common_color.0, most_common_color.1, most_common_color.2);
+    let similar_count: usize = edge_colors
+        .iter()
+        .filter(|c| {
+            let lab = rgb_to_lab(c.0, c.1, c.2);
+            delta_e76(lab, most_common_lab) <= 5.0 // Tight threshold for "same" color
+        })
+        .count();
+
+    let similar_confidence = similar_count as f32 / edge_count as f32;
+    let final_confidence = similar_confidence.max(confidence);
+
+    // Consider it an outline if >80% of edge pixels are the same/similar color
+    let has_outline = final_confidence >= 0.80;
+
+    OutlineDetectionResult {
+        has_outline,
+        outline_color: if has_outline { Some(most_common_color) } else { None },
+        confidence: final_confidence,
+        edge_pixel_count: edge_count,
+    }
+}
+
+// ============================================================================
 // MAIN ENTRY POINT
 // ============================================================================
 
+/// Legacy entry point - processes image file with all operations
+///
+/// This function is retained for backward compatibility with existing v1 UI.
+/// For v2, use the individual operations: `normalize_alpha`, `merge_colors`, `add_outline`
 pub fn process_image(
     input_path: PathBuf,
     output_path: PathBuf,
@@ -435,18 +713,18 @@ pub fn process_image(
     let original_size = rgba.dimensions();
 
     // Step 1: Opacity normalization (always runs)
-    normalize_opacity(&mut rgba, &settings);
+    normalize_opacity_internal(&mut rgba, &settings);
 
     // Step 2: Color simplification (if enabled)
     let (colors_before, colors_after, clusters) = if settings.enable_color_simplify {
-        simplify_colors(&mut rgba, settings.lab_merge_threshold)
+        simplify_colors_internal(&mut rgba, settings.lab_merge_threshold)
     } else {
         (0, 0, 0)
     };
 
     // Step 3: Outline generation (if enabled and thickness > 0)
     if settings.enable_outline && settings.outline_thickness > 0 {
-        generate_outline(&mut rgba, &settings);
+        generate_outline_internal(&mut rgba, &settings);
     }
 
     // Ensure output directory exists
@@ -463,6 +741,36 @@ pub fn process_image(
         unique_colors_after: colors_after,
         clusters_created: clusters,
     })
+}
+
+// ============================================================================
+// V2 IN-MEMORY PROCESSING
+// ============================================================================
+
+/// Load an image from disk into memory
+pub fn load_image(path: &PathBuf) -> Result<RgbaImage> {
+    let img = image::open(path)
+        .map_err(|e| PixelsError::Processing(format!("Failed to load {}: {}", path.display(), e)))?;
+    Ok(img.to_rgba8())
+}
+
+/// Save an in-memory image to disk
+pub fn save_image(img: &RgbaImage, path: &PathBuf) -> Result<()> {
+    // Ensure output directory exists
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    img.save(path)?;
+    Ok(())
+}
+
+/// Encode image as PNG bytes (for preview/transfer without file I/O)
+pub fn encode_png(img: &RgbaImage) -> Result<Vec<u8>> {
+    use std::io::Cursor;
+    let mut buffer = Cursor::new(Vec::new());
+    img.write_to(&mut buffer, image::ImageFormat::Png)
+        .map_err(|e| PixelsError::Processing(format!("Failed to encode PNG: {}", e)))?;
+    Ok(buffer.into_inner())
 }
 
 // ============================================================================

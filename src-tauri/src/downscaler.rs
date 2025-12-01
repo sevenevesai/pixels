@@ -37,6 +37,23 @@ pub struct DownscaleResult {
     pub grid_detected: bool,
 }
 
+/// Result of scale detection analysis
+#[derive(Debug, Clone, Serialize)]
+pub struct ScaleDetectionResult {
+    /// Detected scale factor (1 = native pixel art, >1 = AI upscaled)
+    pub detected_scale: u32,
+    /// Whether a clear pixel grid was detected via FFT
+    pub grid_detected: bool,
+    /// Confidence in the detection (0.0 - 1.0)
+    pub confidence: f32,
+    /// Whether this image appears to be AI-upscaled pixel art
+    pub is_ai_upscaled: bool,
+    /// Original image dimensions
+    pub dimensions: (u32, u32),
+    /// Estimated native dimensions after downscaling
+    pub estimated_native_size: (u32, u32),
+}
+
 // ============================================================================
 // FFT GRID DETECTION
 // ============================================================================
@@ -436,6 +453,92 @@ fn pad_to_multiple(img: &RgbaImage, multiple: u32) -> RgbaImage {
     image::imageops::overlay(&mut canvas, img, offset_x as i64, offset_y as i64);
 
     canvas
+}
+
+// ============================================================================
+// PUBLIC API
+// ============================================================================
+
+/// Public wrapper: Auto-trim transparent borders from an image
+pub fn auto_trim_image(img: &RgbaImage) -> RgbaImage {
+    auto_trim(img)
+}
+
+/// Public wrapper: Detect grid size using FFT
+pub fn detect_grid_for_image(img: &RgbaImage) -> Option<f32> {
+    detect_grid_size(img)
+}
+
+/// Public wrapper: Find optimal scale and phase
+pub fn find_optimal_scale_for_image(img: &RgbaImage, grid_hint: Option<f32>) -> (u32, u32, u32) {
+    find_optimal_scale_v4(img, grid_hint)
+}
+
+/// Public wrapper: Downsample with phase-aware sampling
+pub fn downsample_image(img: &RgbaImage, scale: u32, phase_x: u32, phase_y: u32) -> RgbaImage {
+    downsample_with_phase(img, scale, phase_x, phase_y)
+}
+
+/// Detect the scale factor of an image without modifying it
+/// Returns detection results including whether the image appears to be AI-upscaled
+pub fn detect_scale(input_path: PathBuf) -> Result<ScaleDetectionResult> {
+    // Load image
+    let img = image::open(&input_path)
+        .map_err(|e| PixelsError::Processing(format!("Failed to load {}: {}", input_path.display(), e)))?;
+
+    let rgba = img.to_rgba8();
+    let dimensions = rgba.dimensions();
+
+    // Trim for accurate detection (same as downscale_image does)
+    let trimmed = auto_trim(&rgba);
+
+    // Detect grid using FFT
+    let grid_hint = detect_grid_size(&trimmed);
+
+    // Find optimal scale
+    let (scale, _phase_x, _phase_y) = find_optimal_scale_v4(&trimmed, grid_hint);
+
+    // Calculate confidence based on variance ratio
+    // Lower variance = higher confidence that we found a real grid
+    let min_scale = 6u32;
+    let max_scale = 20u32;
+
+    let mut variances: Vec<(u32, f32)> = Vec::new();
+    for s in min_scale..=max_scale {
+        let (_, _, var) = find_best_phase_for_scale(&trimmed, s);
+        variances.push((s, var));
+    }
+
+    let min_var = variances.iter().map(|(_, v)| *v).fold(f32::MAX, f32::min);
+    let max_var = variances.iter().map(|(_, v)| *v).fold(0.0f32, f32::max);
+
+    // Confidence: how much better is our detected scale vs alternatives
+    let detected_var = variances.iter().find(|(s, _)| *s == scale).map(|(_, v)| *v).unwrap_or(min_var);
+    let confidence = if max_var > min_var {
+        1.0 - (detected_var - min_var) / (max_var - min_var)
+    } else {
+        0.5 // Can't determine confidence
+    };
+
+    // Consider it AI-upscaled if scale > 1 and we have reasonable confidence
+    // Also check if grid was detected via FFT
+    let is_ai_upscaled = scale > 1 && (grid_hint.is_some() || confidence > 0.6);
+
+    // Estimate native size
+    let estimated_native_size = if scale > 1 {
+        (dimensions.0 / scale, dimensions.1 / scale)
+    } else {
+        dimensions
+    };
+
+    Ok(ScaleDetectionResult {
+        detected_scale: scale,
+        grid_detected: grid_hint.is_some(),
+        confidence,
+        is_ai_upscaled,
+        dimensions,
+        estimated_native_size,
+    })
 }
 
 // ============================================================================
