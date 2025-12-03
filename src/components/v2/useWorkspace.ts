@@ -59,6 +59,9 @@ export function useWorkspace() {
       const downscaleSettings = (settings.downscaleEnabled && source.detectedType === 'ai_upscaled') ? {
         enabled: true,
         auto_trim: settings.downscaleAutoTrim,
+        // Use manual dimensions if set, otherwise auto-detect
+        target_width: settings.downscaleTargetWidth || undefined,
+        target_height: settings.downscaleTargetHeight || undefined,
       } : null;
 
       const alphaSettings = settings.alphaEnabled ? {
@@ -154,6 +157,9 @@ export function useWorkspace() {
           const downscaleSettings = (settings.downscaleEnabled && source.detectedType === 'ai_upscaled') ? {
             enabled: true,
             auto_trim: settings.downscaleAutoTrim,
+            // Use manual dimensions if set, otherwise auto-detect
+            target_width: settings.downscaleTargetWidth || undefined,
+            target_height: settings.downscaleTargetHeight || undefined,
           } : null;
 
           const pngBytes = await invoke<number[]>('generate_preview_command', {
@@ -558,22 +564,40 @@ export function useWorkspace() {
       const settings = state.settings;
       const [r, g, b, a] = hexToRgba(settings.outlineColor);
 
-      // Process and save to output path
-      await invoke('process_image_command', {
+      // Only apply downscale if enabled AND image is detected as AI-upscaled
+      const downscaleSettings = (settings.downscaleEnabled && source.detectedType === 'ai_upscaled') ? {
+        enabled: true,
+        auto_trim: settings.downscaleAutoTrim,
+        // Use manual dimensions if set, otherwise auto-detect
+        target_width: settings.downscaleTargetWidth || undefined,
+        target_height: settings.downscaleTargetHeight || undefined,
+      } : null;
+
+      const alphaSettings = settings.alphaEnabled ? {
+        low_cutoff: settings.alphaLowCutoff,
+        high_min: settings.alphaHighMin,
+        high_max: 255,
+      } : null;
+
+      const mergeSettings = settings.mergeEnabled ? {
+        threshold: settings.mergeThreshold,
+      } : null;
+
+      const outlineSettings = settings.outlineEnabled ? {
+        color: [r, g, b, a],
+        connectivity: 'four',
+        thickness: settings.outlineThickness,
+        edge_transparent_cutoff: 0,
+      } : null;
+
+      // Use the new process_and_save_command that includes downscaling
+      await invoke('process_and_save_command', {
         inputPath: source.fullPath,
         outputPath: outputPath,
-        settings: {
-          alpha_low_cutoff: settings.alphaLowCutoff,
-          alpha_high_min: settings.alphaHighMin,
-          alpha_high_max: 255,
-          enable_color_simplify: settings.mergeEnabled,
-          lab_merge_threshold: settings.mergeThreshold,
-          enable_outline: settings.outlineEnabled,
-          outline_color: [r, g, b, a],
-          edge_transparent_cutoff: 0,
-          outline_connectivity: 'four',
-          outline_thickness: settings.outlineThickness,
-        },
+        downscaleSettings,
+        alphaSettings,
+        mergeSettings,
+        outlineSettings,
       });
 
       setState(prev => ({

@@ -16,7 +16,7 @@ use processor::{
     AlphaSettings, MergeSettings, OutlineSettings,
     MergeResult, OutlineDetectionResult,
 };
-use downscaler::{DownscalerSettings, DownscaleResult};
+use downscaler::{DownscalerSettings, DownscaleResult, ManualDownscaleSettings};
 use db::{Database, Project, ProjectSettings};
 use state::{WorkspaceManager, WorkspaceState};
 
@@ -157,6 +157,33 @@ async fn detect_outline_command(input_path: String) -> Result<OutlineDetectionRe
     .map_err(|e| error::PixelsError::Processing(format!("Task join error: {}", e)))?
 }
 
+/// Generate downscale-only preview with manual target dimensions
+/// Returns PNG bytes for live preview without saving
+#[tauri::command]
+async fn downscale_preview_command(
+    input_path: String,
+    target_width: u32,
+    target_height: u32,
+    auto_trim: bool,
+) -> Result<Vec<u8>> {
+    let input = PathBuf::from(input_path);
+
+    tokio::task::spawn_blocking(move || {
+        let img = processor::load_image(&input)?;
+
+        let settings = ManualDownscaleSettings {
+            target_width,
+            target_height,
+            auto_trim,
+        };
+
+        let result = downscaler::downscale_manual_preview(&img, &settings);
+        processor::encode_png(&result)
+    })
+    .await
+    .map_err(|e| error::PixelsError::Processing(format!("Task join error: {}", e)))?
+}
+
 /// Settings for inline downscale during preview
 #[derive(Debug, Clone, Deserialize)]
 pub struct PreviewDownscaleSettings {
@@ -164,6 +191,10 @@ pub struct PreviewDownscaleSettings {
     pub enabled: bool,
     /// Auto-trim transparent borders
     pub auto_trim: bool,
+    /// Manual target width (if set, uses manual dimensions instead of auto-detect)
+    pub target_width: Option<u32>,
+    /// Manual target height (if set, uses manual dimensions instead of auto-detect)
+    pub target_height: Option<u32>,
 }
 
 /// Generate preview PNG bytes without saving to disk
@@ -183,15 +214,23 @@ async fn generate_preview_command(
         // Downscale first (if enabled)
         if let Some(ds_settings) = downscale_settings {
             if ds_settings.enabled {
-                // Use the downscaler's internal functions
-                if ds_settings.auto_trim {
-                    img = downscaler::auto_trim_image(&img);
-                }
-                // Detect and apply downscaling
-                let grid_hint = downscaler::detect_grid_for_image(&img);
-                let (scale, phase_x, phase_y) = downscaler::find_optimal_scale_for_image(&img, grid_hint);
-                if scale > 1 {
-                    img = downscaler::downsample_image(&img, scale, phase_x, phase_y);
+                // Check if manual dimensions are provided
+                if let (Some(target_w), Some(target_h)) = (ds_settings.target_width, ds_settings.target_height) {
+                    // Use manual dimensions
+                    if ds_settings.auto_trim {
+                        img = downscaler::auto_trim_image(&img);
+                    }
+                    img = downscaler::downscale_to_dimensions(&img, target_w, target_h);
+                } else {
+                    // Use auto-detection
+                    if ds_settings.auto_trim {
+                        img = downscaler::auto_trim_image(&img);
+                    }
+                    let grid_hint = downscaler::detect_grid_for_image(&img);
+                    let (scale, phase_x, phase_y) = downscaler::find_optimal_scale_for_image(&img, grid_hint);
+                    if scale > 1 {
+                        img = downscaler::downsample_image(&img, scale, phase_x, phase_y);
+                    }
                 }
             }
         }
@@ -208,6 +247,63 @@ async fn generate_preview_command(
         }
 
         processor::encode_png(&img)
+    })
+    .await
+    .map_err(|e| error::PixelsError::Processing(format!("Task join error: {}", e)))?
+}
+
+/// Process and save image to disk (same pipeline as preview but saves to file)
+#[tauri::command]
+async fn process_and_save_command(
+    input_path: String,
+    output_path: String,
+    downscale_settings: Option<PreviewDownscaleSettings>,
+    alpha_settings: Option<AlphaSettings>,
+    merge_settings: Option<MergeSettings>,
+    outline_settings: Option<OutlineSettings>,
+) -> Result<()> {
+    let input = PathBuf::from(input_path);
+    let output = PathBuf::from(output_path);
+
+    tokio::task::spawn_blocking(move || {
+        let mut img = processor::load_image(&input)?;
+
+        // Downscale first (if enabled)
+        if let Some(ds_settings) = downscale_settings {
+            if ds_settings.enabled {
+                // Check if manual dimensions are provided
+                if let (Some(target_w), Some(target_h)) = (ds_settings.target_width, ds_settings.target_height) {
+                    // Use manual dimensions
+                    if ds_settings.auto_trim {
+                        img = downscaler::auto_trim_image(&img);
+                    }
+                    img = downscaler::downscale_to_dimensions(&img, target_w, target_h);
+                } else {
+                    // Use auto-detection
+                    if ds_settings.auto_trim {
+                        img = downscaler::auto_trim_image(&img);
+                    }
+                    let grid_hint = downscaler::detect_grid_for_image(&img);
+                    let (scale, phase_x, phase_y) = downscaler::find_optimal_scale_for_image(&img, grid_hint);
+                    if scale > 1 {
+                        img = downscaler::downsample_image(&img, scale, phase_x, phase_y);
+                    }
+                }
+            }
+        }
+
+        // Apply post-processing operations in order (if settings provided)
+        if let Some(settings) = alpha_settings {
+            processor::normalize_alpha(&mut img, &settings);
+        }
+        if let Some(settings) = merge_settings {
+            processor::merge_colors(&mut img, &settings);
+        }
+        if let Some(settings) = outline_settings {
+            processor::add_outline(&mut img, &settings);
+        }
+
+        processor::save_image(&img, &output)
     })
     .await
     .map_err(|e| error::PixelsError::Processing(format!("Task join error: {}", e)))?
@@ -290,6 +386,36 @@ async fn add_version_command(
         let source = manager.get_or_create_source(&relative_path)?;
         source.add_version(version);
         manager.save()
+    })
+    .await
+    .map_err(|e| error::PixelsError::Processing(format!("Task join error: {}", e)))?
+}
+
+/// Backup original image to .pixels/cache before overwriting
+/// Returns the cache path where the backup was saved
+#[tauri::command]
+async fn backup_original_command(
+    workspace_path: String,
+    relative_path: String,
+) -> Result<String> {
+    let ws_path = PathBuf::from(&workspace_path);
+    let rel_path = relative_path.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let manager = WorkspaceManager::open(&ws_path)?;
+        let source_file = ws_path.join(&rel_path);
+
+        // Generate backup filename using hash
+        let hash = state::hash_file(&source_file)?;
+        let backup_name = format!("{}_original.png", &hash[..16]);
+        let backup_path = manager.cache_dir().join(&backup_name);
+
+        // Only backup if not already backed up
+        if !backup_path.exists() {
+            std::fs::copy(&source_file, &backup_path)?;
+        }
+
+        Ok(backup_name)
     })
     .await
     .map_err(|e| error::PixelsError::Processing(format!("Task join error: {}", e)))?
@@ -387,13 +513,16 @@ pub fn run() {
             merge_colors_command,
             add_outline_command,
             detect_outline_command,
+            downscale_preview_command,
             generate_preview_command,
+            process_and_save_command,
             // V2 workspace state
             init_workspace_command,
             load_workspace_command,
             save_workspace_command,
             get_source_state_command,
             add_version_command,
+            backup_original_command,
             // Database/project commands
             get_projects,
             add_project,

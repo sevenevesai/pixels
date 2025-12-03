@@ -54,6 +54,17 @@ pub struct ScaleDetectionResult {
     pub estimated_native_size: (u32, u32),
 }
 
+/// Settings for manual downscale with user-specified dimensions
+#[derive(Debug, Clone, Deserialize)]
+pub struct ManualDownscaleSettings {
+    /// Target width in pixels
+    pub target_width: u32,
+    /// Target height in pixels
+    pub target_height: u32,
+    /// Auto-trim transparent borders before downscaling
+    pub auto_trim: bool,
+}
+
 // ============================================================================
 // FFT GRID DETECTION
 // ============================================================================
@@ -168,7 +179,10 @@ struct ScaleResult {
 
 /// Calculate block variance at given scale and phase offset
 /// Uses center region to avoid edge artifacts
+/// Samples up to MAX_SAMPLE_BLOCKS for performance on large images
 fn calculate_block_variance(img: &RgbaImage, scale: u32, phase_x: u32, phase_y: u32) -> f32 {
+    const MAX_SAMPLE_BLOCKS: u32 = 400; // Sample at most 400 blocks (20x20 grid)
+
     let (width, height) = img.dimensions();
 
     // Use center region (middle 2/3) to avoid edge artifacts
@@ -194,11 +208,21 @@ fn calculate_block_variance(img: &RgbaImage, scale: u32, phase_x: u32, phase_y: 
         return f32::MAX;
     }
 
+    // Calculate step size for sampling (sample evenly distributed blocks)
+    let total_blocks = n_blocks_x * n_blocks_y;
+    let step = if total_blocks > MAX_SAMPLE_BLOCKS {
+        ((total_blocks as f32 / MAX_SAMPLE_BLOCKS as f32).sqrt().ceil() as u32).max(1)
+    } else {
+        1
+    };
+
     let mut total_variance = 0.0f32;
     let mut block_count = 0u32;
 
-    for block_y in 0..n_blocks_y {
-        for block_x in 0..n_blocks_x {
+    let mut block_y = 0;
+    while block_y < n_blocks_y {
+        let mut block_x = 0;
+        while block_x < n_blocks_x {
             let start_x = region_x_start + adj_px + block_x * scale;
             let start_y = region_y_start + adj_py + block_y * scale;
 
@@ -223,35 +247,36 @@ fn calculate_block_variance(img: &RgbaImage, scale: u32, phase_x: u32, phase_y: 
                 }
             }
 
-            if pixel_count == 0 {
-                continue;
-            }
+            if pixel_count > 0 {
+                let r_mean = r_sum / pixel_count as f32;
+                let g_mean = g_sum / pixel_count as f32;
+                let b_mean = b_sum / pixel_count as f32;
 
-            let r_mean = r_sum / pixel_count as f32;
-            let g_mean = g_sum / pixel_count as f32;
-            let b_mean = b_sum / pixel_count as f32;
+                // Calculate variance within block
+                let mut variance = 0.0f32;
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let x = start_x + dx;
+                        let y = start_y + dy;
 
-            // Calculate variance within block
-            let mut variance = 0.0f32;
-            for dy in 0..scale {
-                for dx in 0..scale {
-                    let x = start_x + dx;
-                    let y = start_y + dy;
-
-                    if x < width && y < height {
-                        let pixel = img.get_pixel(x, y);
-                        let dr = pixel[0] as f32 - r_mean;
-                        let dg = pixel[1] as f32 - g_mean;
-                        let db = pixel[2] as f32 - b_mean;
-                        variance += dr * dr + dg * dg + db * db;
+                        if x < width && y < height {
+                            let pixel = img.get_pixel(x, y);
+                            let dr = pixel[0] as f32 - r_mean;
+                            let dg = pixel[1] as f32 - g_mean;
+                            let db = pixel[2] as f32 - b_mean;
+                            variance += dr * dr + dg * dg + db * db;
+                        }
                     }
                 }
+
+                variance /= (pixel_count * 3) as f32;
+                total_variance += variance;
+                block_count += 1;
             }
 
-            variance /= (pixel_count * 3) as f32;
-            total_variance += variance;
-            block_count += 1;
+            block_x += step;
         }
+        block_y += step;
     }
 
     if block_count == 0 {
@@ -308,15 +333,38 @@ fn find_best_phase_for_scale(img: &RgbaImage, scale: u32) -> (u32, u32, f32) {
 }
 
 /// Find optimal scale using block variance + phase search
-/// Returns (scale, phase_x, phase_y)
-fn find_optimal_scale_v4(img: &RgbaImage, grid_hint: Option<f32>) -> (u32, u32, u32) {
+/// Returns (scale, phase_x, phase_y, all_results) - includes results for confidence calculation
+fn find_optimal_scale_v4_with_results(img: &RgbaImage, grid_hint: Option<f32>) -> (u32, u32, u32, Vec<ScaleResult>) {
     let min_scale = 6u32;
     let max_scale = 20u32;
 
     let mut all_results: Vec<ScaleResult> = Vec::new();
 
-    // Test all scales
-    for scale in min_scale..=max_scale {
+    // If we have an FFT hint, prioritize scales near it for faster detection
+    let scales_to_test: Vec<u32> = if let Some(hint) = grid_hint {
+        // Test hint scale and nearby first, then expand
+        let hint_scale = hint.round() as u32;
+        let mut scales: Vec<u32> = Vec::new();
+
+        // Add hint and immediate neighbors first (most likely to be correct)
+        for offset in 0..=2i32 {
+            let s = (hint_scale as i32 + offset).clamp(min_scale as i32, max_scale as i32) as u32;
+            if !scales.contains(&s) { scales.push(s); }
+            let s = (hint_scale as i32 - offset).clamp(min_scale as i32, max_scale as i32) as u32;
+            if !scales.contains(&s) { scales.push(s); }
+        }
+
+        // Add remaining scales
+        for s in min_scale..=max_scale {
+            if !scales.contains(&s) { scales.push(s); }
+        }
+        scales
+    } else {
+        (min_scale..=max_scale).collect()
+    };
+
+    // Test scales
+    for scale in scales_to_test {
         let (px, py, var) = find_best_phase_for_scale(img, scale);
         all_results.push(ScaleResult {
             scale,
@@ -325,6 +373,9 @@ fn find_optimal_scale_v4(img: &RgbaImage, grid_hint: Option<f32>) -> (u32, u32, 
             variance: var,
         });
     }
+
+    // Sort by scale for consistent ordering
+    all_results.sort_by_key(|r| r.scale);
 
     // Find minimum variance
     let min_var = all_results
@@ -335,7 +386,7 @@ fn find_optimal_scale_v4(img: &RgbaImage, grid_hint: Option<f32>) -> (u32, u32, 
     if min_var == f32::MAX {
         // Fallback to grid hint or default
         let scale = grid_hint.map(|g| g.round() as u32).unwrap_or(10);
-        return (scale.clamp(min_scale, max_scale), 0, 0);
+        return (scale.clamp(min_scale, max_scale), 0, 0, all_results);
     }
 
     // Find all "valid" scales (variance within 2x of minimum)
@@ -369,7 +420,14 @@ fn find_optimal_scale_v4(img: &RgbaImage, grid_hint: Option<f32>) -> (u32, u32, 
             .unwrap()
     };
 
-    (best.scale, best.phase_x, best.phase_y)
+    (best.scale, best.phase_x, best.phase_y, all_results)
+}
+
+/// Find optimal scale using block variance + phase search
+/// Returns (scale, phase_x, phase_y)
+fn find_optimal_scale_v4(img: &RgbaImage, grid_hint: Option<f32>) -> (u32, u32, u32) {
+    let (scale, px, py, _) = find_optimal_scale_v4_with_results(img, grid_hint);
+    (scale, px, py)
 }
 
 /// Downsample image using phase-aware sampling
@@ -479,6 +537,57 @@ pub fn downsample_image(img: &RgbaImage, scale: u32, phase_x: u32, phase_y: u32)
     downsample_with_phase(img, scale, phase_x, phase_y)
 }
 
+/// Downscale image to exact target dimensions using nearest-neighbor sampling
+/// This is for manual user-specified dimensions when auto-detection isn't right
+pub fn downscale_to_dimensions(img: &RgbaImage, target_width: u32, target_height: u32) -> RgbaImage {
+    let (src_width, src_height) = img.dimensions();
+
+    if target_width == 0 || target_height == 0 {
+        return img.clone();
+    }
+
+    // If upscaling or same size, just return as-is
+    if target_width >= src_width && target_height >= src_height {
+        return img.clone();
+    }
+
+    // Calculate scale factors
+    let scale_x = src_width as f32 / target_width as f32;
+    let scale_y = src_height as f32 / target_height as f32;
+
+    let mut result = ImageBuffer::new(target_width, target_height);
+
+    for out_y in 0..target_height {
+        for out_x in 0..target_width {
+            // Sample from center of source region
+            let src_x = ((out_x as f32 + 0.5) * scale_x) as u32;
+            let src_y = ((out_y as f32 + 0.5) * scale_y) as u32;
+
+            // Clamp to valid range
+            let src_x = src_x.min(src_width - 1);
+            let src_y = src_y.min(src_height - 1);
+
+            result.put_pixel(out_x, out_y, *img.get_pixel(src_x, src_y));
+        }
+    }
+
+    result
+}
+
+/// Downscale image with manual settings (target dimensions)
+/// Returns PNG bytes for preview
+pub fn downscale_manual_preview(img: &RgbaImage, settings: &ManualDownscaleSettings) -> RgbaImage {
+    let mut working = img.clone();
+
+    // Auto-trim if enabled
+    if settings.auto_trim {
+        working = auto_trim(&working);
+    }
+
+    // Downscale to target dimensions
+    downscale_to_dimensions(&working, settings.target_width, settings.target_height)
+}
+
 /// Detect the scale factor of an image without modifying it
 /// Returns detection results including whether the image appears to be AI-upscaled
 pub fn detect_scale(input_path: PathBuf) -> Result<ScaleDetectionResult> {
@@ -495,25 +604,15 @@ pub fn detect_scale(input_path: PathBuf) -> Result<ScaleDetectionResult> {
     // Detect grid using FFT
     let grid_hint = detect_grid_size(&trimmed);
 
-    // Find optimal scale
-    let (scale, _phase_x, _phase_y) = find_optimal_scale_v4(&trimmed, grid_hint);
+    // Find optimal scale and get all variance results (reused for confidence)
+    let (scale, _phase_x, _phase_y, all_results) = find_optimal_scale_v4_with_results(&trimmed, grid_hint);
 
-    // Calculate confidence based on variance ratio
-    // Lower variance = higher confidence that we found a real grid
-    let min_scale = 6u32;
-    let max_scale = 20u32;
-
-    let mut variances: Vec<(u32, f32)> = Vec::new();
-    for s in min_scale..=max_scale {
-        let (_, _, var) = find_best_phase_for_scale(&trimmed, s);
-        variances.push((s, var));
-    }
-
-    let min_var = variances.iter().map(|(_, v)| *v).fold(f32::MAX, f32::min);
-    let max_var = variances.iter().map(|(_, v)| *v).fold(0.0f32, f32::max);
+    // Calculate confidence from the already-computed variance results
+    let min_var = all_results.iter().map(|r| r.variance).fold(f32::MAX, f32::min);
+    let max_var = all_results.iter().map(|r| r.variance).fold(0.0f32, f32::max);
 
     // Confidence: how much better is our detected scale vs alternatives
-    let detected_var = variances.iter().find(|(s, _)| *s == scale).map(|(_, v)| *v).unwrap_or(min_var);
+    let detected_var = all_results.iter().find(|r| r.scale == scale).map(|r| r.variance).unwrap_or(min_var);
     let confidence = if max_var > min_var {
         1.0 - (detected_var - min_var) / (max_var - min_var)
     } else {

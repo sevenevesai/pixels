@@ -22,9 +22,12 @@ export interface SourceImage {
 }
 
 export interface ProcessingSettings {
-  // Downscale (applied first)
+  // Downscale (applied first) - for auto mode
   downscaleEnabled: boolean;
   downscaleAutoTrim: boolean;
+  // Manual target dimensions (if set, overrides auto-detection)
+  downscaleTargetWidth: number | null;
+  downscaleTargetHeight: number | null;
 
   // Alpha normalization
   alphaEnabled: boolean;
@@ -41,9 +44,34 @@ export interface ProcessingSettings {
   outlineThickness: number;
 }
 
+/** State for the downscale step in one-off mode */
+export interface DownscaleState {
+  /** Original image dimensions */
+  originalWidth: number;
+  originalHeight: number;
+  /** Auto-detected scale factor */
+  detectedScale: number;
+  /** Auto-detected target dimensions */
+  detectedWidth: number;
+  detectedHeight: number;
+  /** User-adjusted target dimensions */
+  targetWidth: number;
+  targetHeight: number;
+  /** Whether to auto-trim before downscaling */
+  autoTrim: boolean;
+  /** Whether downscale step is confirmed/locked */
+  confirmed: boolean;
+  /** Whether currently generating preview */
+  previewLoading: boolean;
+  /** Preview image data URL */
+  previewData: string | null;
+}
+
 export const DEFAULT_SETTINGS: ProcessingSettings = {
   downscaleEnabled: true,  // Auto-enabled, will only apply if AI-upscaled detected
   downscaleAutoTrim: true,
+  downscaleTargetWidth: null,  // null = use auto-detection
+  downscaleTargetHeight: null, // null = use auto-detection
 
   alphaEnabled: true,
   alphaLowCutoff: 200,
