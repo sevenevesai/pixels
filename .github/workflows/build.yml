@@ -62,10 +62,19 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Ad-hoc sign on macOS to avoid "damaged" error
+          APPLE_SIGNING_IDENTITY: "-"
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'Pixels Toolkit ${{ github.ref_name }}'
-          releaseBody: 'See the assets below to download the installer for your platform.'
+          releaseBody: |
+            ## Installation
+
+            **Windows:** Download the `.msi` file and run the installer.
+
+            **macOS:** Download the `.dmg` for your Mac (Apple Silicon or Intel), open it, drag to Applications, then **right-click → Open** on first launch.
+
+            **Linux:** Download `.deb` (Debian/Ubuntu) or `.AppImage` (universal).
           releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
@@ -98,6 +107,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: "-"
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'Pixels Toolkit ${{ github.ref_name }}'
