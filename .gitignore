@@ -7,29 +7,47 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# Dependencies
 node_modules
+
+# Build output
 dist
 dist-ssr
 *.local
+
+# Tauri build
+src-tauri/target
 
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
 .idea
-.DS_Store
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
 
-# Tauri
-src-tauri/target
+# OS files
+.DS_Store
+Thumbs.db
 
-# Python archive (legacy code for reference)
-python-archive/build/
-python-archive/dist/
-python-archive/installer_output/
-python-archive/venv_build/
-python-archive/**/__pycache__/
-python-archive/**/*.pyc
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+venv*/
+*.eggs
+
+# Test images and downscale test data
+downscale_tests/
+
+# Prototyping / scratch work
+proto/
+
+# Legacy Python app
+legacy/
+
+# Pixels workspace cache (created at runtime)
+.pixels/
