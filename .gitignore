@@ -53,3 +53,6 @@ legacy/
 .pixels/
 
 .socratic/state/
+
+# Tauri signing keys (NEVER commit private key)
+src-tauri/.tauri-private-key

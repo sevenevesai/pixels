@@ -126,6 +126,32 @@ pub struct MergeResult {
     pub clusters_created: usize,
 }
 
+/// Settings for background removal
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundSettings {
+    /// RGB distance tolerance for flood-fill matching (default: 30)
+    pub tolerance: u8,
+}
+
+impl Default for BackgroundSettings {
+    fn default() -> Self {
+        Self { tolerance: 30 }
+    }
+}
+
+/// Result from background detection
+#[derive(Debug, Clone, Serialize)]
+pub struct BackgroundDetectionResult {
+    /// Whether a solid background was detected
+    pub has_background: bool,
+    /// The detected background color as [R, G, B] (if any)
+    pub background_color: Option<[u8; 3]>,
+    /// Confidence score (0.0 - 1.0) — fraction of edge pixels matching
+    pub confidence: f32,
+    /// Number of edge pixels sampled
+    pub edge_pixel_count: usize,
+}
+
 /// Result from outline detection
 #[derive(Debug, Clone, Serialize)]
 pub struct OutlineDetectionResult {
@@ -689,6 +715,245 @@ pub fn detect_outline(img: &RgbaImage) -> OutlineDetectionResult {
         outline_color: if has_outline { Some(most_common_color) } else { None },
         confidence: final_confidence,
         edge_pixel_count: edge_count,
+    }
+}
+
+// ============================================================================
+// BACKGROUND DETECTION & REMOVAL
+// ============================================================================
+
+/// RGB Euclidean distance between two colors
+fn color_distance_rgb(c1: [u8; 3], c2: [u8; 3]) -> f32 {
+    let dr = c1[0] as f32 - c2[0] as f32;
+    let dg = c1[1] as f32 - c2[1] as f32;
+    let db = c1[2] as f32 - c2[2] as f32;
+    (dr * dr + dg * dg + db * db).sqrt()
+}
+
+/// Detect if an image has a solid-color background.
+///
+/// Samples all opaque pixels on the 4 image borders and checks if they
+/// form a uniform color cluster. A dominant edge color covering >50% of
+/// border pixels (within RGB distance 15) indicates a solid background.
+pub fn detect_background(img: &RgbaImage) -> BackgroundDetectionResult {
+    let (width, height) = img.dimensions();
+
+    if width < 2 || height < 2 {
+        return BackgroundDetectionResult {
+            has_background: false,
+            background_color: None,
+            confidence: 0.0,
+            edge_pixel_count: 0,
+        };
+    }
+
+    // Collect opaque edge pixels from all 4 borders
+    let mut edge_colors: Vec<[u8; 3]> = Vec::new();
+
+    // Top and bottom rows
+    for x in 0..width {
+        let top = img.get_pixel(x, 0);
+        if top[3] > 0 {
+            edge_colors.push([top[0], top[1], top[2]]);
+        }
+        let bottom = img.get_pixel(x, height - 1);
+        if bottom[3] > 0 {
+            edge_colors.push([bottom[0], bottom[1], bottom[2]]);
+        }
+    }
+
+    // Left and right columns (skip corners already counted)
+    for y in 1..(height - 1) {
+        let left = img.get_pixel(0, y);
+        if left[3] > 0 {
+            edge_colors.push([left[0], left[1], left[2]]);
+        }
+        let right = img.get_pixel(width - 1, y);
+        if right[3] > 0 {
+            edge_colors.push([right[0], right[1], right[2]]);
+        }
+    }
+
+    let edge_count = edge_colors.len();
+    if edge_count == 0 {
+        return BackgroundDetectionResult {
+            has_background: false,
+            background_color: None,
+            confidence: 0.0,
+            edge_pixel_count: 0,
+        };
+    }
+
+    // Find most common exact edge color
+    let mut color_counts: HashMap<[u8; 3], usize> = HashMap::new();
+    for color in &edge_colors {
+        *color_counts.entry(*color).or_insert(0) += 1;
+    }
+
+    let (most_common, _) = color_counts
+        .iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(color, count)| (*color, *count))
+        .unwrap();
+
+    // Count edge pixels within tight tolerance of the dominant color
+    const DETECTION_TOLERANCE: f32 = 15.0;
+    let similar_count = edge_colors
+        .iter()
+        .filter(|c| color_distance_rgb(**c, most_common) <= DETECTION_TOLERANCE)
+        .count();
+
+    let confidence = similar_count as f32 / edge_count as f32;
+    let has_background = confidence >= 0.50;
+
+    BackgroundDetectionResult {
+        has_background,
+        background_color: if has_background { Some(most_common) } else { None },
+        confidence,
+        edge_pixel_count: edge_count,
+    }
+}
+
+/// Remove solid-color background from an image.
+///
+/// Two-phase removal:
+/// 1. BFS flood-fill from all 4 image borders (removes outer background)
+/// 2. Interior scan: removes ALL remaining pixels matching the background
+///    color (catches enclosed areas like gaps between limbs, holes, etc.)
+///
+/// Followed by an edge-cleanup pass that removes anti-aliasing pixels
+/// adjacent to newly-transparent areas.
+pub fn remove_background(img: &mut RgbaImage, settings: &BackgroundSettings) {
+    let (width, height) = img.dimensions();
+    if width < 2 || height < 2 {
+        return;
+    }
+
+    let detection = detect_background(img);
+    if !detection.has_background {
+        return;
+    }
+
+    let bg_color = detection.background_color.unwrap();
+    let tolerance = settings.tolerance as f32;
+
+    // Track removed pixels
+    let mut removed = vec![vec![false; width as usize]; height as usize];
+
+    // BFS flood-fill from edges
+    let mut queue: std::collections::VecDeque<(u32, u32)> = std::collections::VecDeque::new();
+
+    // Seed with all border pixels matching background
+    for x in 0..width {
+        for &y in &[0, height - 1] {
+            let p = img.get_pixel(x, y);
+            if p[3] > 0 && color_distance_rgb([p[0], p[1], p[2]], bg_color) <= tolerance {
+                removed[y as usize][x as usize] = true;
+                queue.push_back((x, y));
+            }
+        }
+    }
+    for y in 1..(height - 1) {
+        for &x in &[0, width - 1] {
+            let p = img.get_pixel(x, y);
+            if p[3] > 0 && !removed[y as usize][x as usize]
+                && color_distance_rgb([p[0], p[1], p[2]], bg_color) <= tolerance
+            {
+                removed[y as usize][x as usize] = true;
+                queue.push_back((x, y));
+            }
+        }
+    }
+
+    // 4-way flood fill
+    while let Some((x, y)) = queue.pop_front() {
+        let neighbors = [
+            (x.wrapping_sub(1), y),
+            (x + 1, y),
+            (x, y.wrapping_sub(1)),
+            (x, y + 1),
+        ];
+
+        for (nx, ny) in neighbors {
+            if nx >= width || ny >= height {
+                continue;
+            }
+            if removed[ny as usize][nx as usize] {
+                continue;
+            }
+            let p = img.get_pixel(nx, ny);
+            if p[3] == 0 {
+                continue;
+            }
+            if color_distance_rgb([p[0], p[1], p[2]], bg_color) <= tolerance {
+                removed[ny as usize][nx as usize] = true;
+                queue.push_back((nx, ny));
+            }
+        }
+    }
+
+    // Interior pass: remove ALL remaining pixels matching the background color.
+    // The edge flood-fill can't reach enclosed areas (gaps between legs, holes
+    // in objects, etc.) but since we've confirmed the bg color, any interior
+    // pixel matching it within tolerance is also background.
+    for y in 0..height {
+        for x in 0..width {
+            if !removed[y as usize][x as usize] {
+                let p = img.get_pixel(x, y);
+                if p[3] > 0 && color_distance_rgb([p[0], p[1], p[2]], bg_color) <= tolerance {
+                    removed[y as usize][x as usize] = true;
+                }
+            }
+        }
+    }
+
+    // Apply removal
+    for y in 0..height {
+        for x in 0..width {
+            if removed[y as usize][x as usize] {
+                img.get_pixel_mut(x, y)[3] = 0;
+            }
+        }
+    }
+
+    // Edge cleanup: remove anti-aliasing pixels adjacent to removed areas
+    // that are still close to the background color
+    const EDGE_CLEANUP_TOLERANCE: f32 = 20.0;
+    let mut cleanup = vec![vec![false; width as usize]; height as usize];
+
+    for y in 0..height {
+        for x in 0..width {
+            let p = img.get_pixel(x, y);
+            if p[3] == 0 {
+                continue;
+            }
+            if color_distance_rgb([p[0], p[1], p[2]], bg_color) > EDGE_CLEANUP_TOLERANCE {
+                continue;
+            }
+            // Check if adjacent to any newly-transparent pixel
+            let touches_transparent = [
+                (x.wrapping_sub(1), y),
+                (x + 1, y),
+                (x, y.wrapping_sub(1)),
+                (x, y + 1),
+            ]
+            .iter()
+            .any(|&(nx, ny)| {
+                nx < width && ny < height && img.get_pixel(nx, ny)[3] == 0
+            });
+
+            if touches_transparent {
+                cleanup[y as usize][x as usize] = true;
+            }
+        }
+    }
+
+    for y in 0..height {
+        for x in 0..width {
+            if cleanup[y as usize][x as usize] {
+                img.get_pixel_mut(x, y)[3] = 0;
+            }
+        }
     }
 }
 

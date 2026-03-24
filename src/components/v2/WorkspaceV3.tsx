@@ -2,12 +2,69 @@
 // - Single image editing at a time (no batch preview)
 // - Folder navigation in left panel (just thumbnails, no pre-loading)
 // - Universal ImageEditor for both quick-edit and project mode
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { readDir, readFile } from '@tauri-apps/plugin-fs';
 import { invoke } from '@tauri-apps/api/core';
+import { check } from '@tauri-apps/plugin-updater';
+import { relaunch } from '@tauri-apps/plugin-process';
 import { ImageEditor } from './ImageEditor';
 import './Workspace.css';
+
+// Update checker banner — checks on mount, shows banner if update available
+function UpdateBanner() {
+  const [updateAvailable, setUpdateAvailable] = useState<{ version: string; notes: string } | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const [dismissed, setDismissed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function checkForUpdate() {
+      try {
+        const update = await check();
+        if (!cancelled && update?.available) {
+          setUpdateAvailable({
+            version: update.version,
+            notes: update.body || '',
+          });
+        }
+      } catch {
+        // Silent fail — no network, no endpoint, etc.
+      }
+    }
+
+    // Small delay so it doesn't block app startup
+    const timer = setTimeout(checkForUpdate, 2000);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, []);
+
+  if (!updateAvailable || dismissed) return null;
+
+  const handleUpdate = async () => {
+    setInstalling(true);
+    try {
+      const update = await check();
+      if (update?.available) {
+        await update.downloadAndInstall();
+        await relaunch();
+      }
+    } catch (err) {
+      console.error('Update failed:', err);
+      setInstalling(false);
+    }
+  };
+
+  return (
+    <div className="update-banner">
+      <span>Update available: v{updateAvailable.version}</span>
+      <button onClick={handleUpdate} disabled={installing}>
+        {installing ? 'Installing...' : 'Update Now'}
+      </button>
+      <button onClick={() => setDismissed(true)} className="dismiss">Later</button>
+    </div>
+  );
+}
 
 interface FolderImage {
   name: string;
@@ -126,6 +183,7 @@ export function WorkspaceV3() {
   if (state.mode === null) {
     return (
       <div className="workspace">
+        <UpdateBanner />
         <header className="workspace-header">
           <h1 className="workspace-title">Pixels Toolkit</h1>
           <div className="workspace-actions">
@@ -162,6 +220,7 @@ export function WorkspaceV3() {
   if (state.mode === 'quick-edit' && state.currentImage) {
     return (
       <div className="workspace workspace-quick-edit">
+        <UpdateBanner />
         <header className="workspace-header">
           <h1 className="workspace-title">Pixels Toolkit</h1>
           <div className="workspace-actions">
@@ -197,6 +256,7 @@ export function WorkspaceV3() {
 
   return (
     <div className="workspace workspace-folder">
+      <UpdateBanner />
       <header className="workspace-header">
         <h1 className="workspace-title">Pixels Toolkit</h1>
         <div className="workspace-actions">

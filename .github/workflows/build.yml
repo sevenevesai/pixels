@@ -21,7 +21,7 @@ jobs:
         include:
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-            bundles: msi
+            bundles: msi,nsis
           - platform: macos-latest
             target: aarch64-apple-darwin
             bundles: dmg
@@ -62,6 +62,9 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signing key for auto-updater (generates .sig files)
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
           # Ad-hoc sign on macOS to avoid "damaged" error
           APPLE_SIGNING_IDENTITY: "-"
         with:
@@ -79,7 +82,7 @@ jobs:
           prerelease: false
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
-  # Separate job for universal Mac binary (optional, combines both architectures)
+  # Universal Mac binary (combines both architectures)
   build-mac-universal:
     runs-on: macos-latest
     needs: build
@@ -107,6 +110,8 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
           APPLE_SIGNING_IDENTITY: "-"
         with:
           tagName: ${{ github.ref_name }}

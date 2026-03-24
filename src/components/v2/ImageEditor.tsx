@@ -132,6 +132,8 @@ const DEFAULT_SETTINGS: ProcessingSettings = {
   downscaleAutoTrim: true,
   downscaleTargetWidth: null,
   downscaleTargetHeight: null,
+  backgroundEnabled: false,
+  backgroundTolerance: 30,
   alphaEnabled: true,
   alphaLowCutoff: 200,
   alphaHighMin: 200,
@@ -239,11 +241,16 @@ export function ImageEditor({
     setDownscaleState(prev => ({ ...prev, previewLoading: true }));
 
     try {
+      const backgroundSettings = settings.backgroundEnabled ? {
+        tolerance: settings.backgroundTolerance,
+      } : null;
+
       const pngBytes = await invoke<number[]>('downscale_preview_command', {
         inputPath: imagePath,
         targetWidth,
         targetHeight,
         autoTrim,
+        backgroundSettings,
       });
 
       const uint8Array = new Uint8Array(pngBytes);
@@ -258,7 +265,7 @@ export function ImageEditor({
       console.error('Downscale preview failed:', err);
       setDownscaleState(prev => ({ ...prev, previewLoading: false }));
     }
-  }, [imagePath, downscaleState.targetWidth, downscaleState.targetHeight, downscaleState.autoTrim]);
+  }, [imagePath, downscaleState.targetWidth, downscaleState.targetHeight, downscaleState.autoTrim, settings.backgroundEnabled, settings.backgroundTolerance]);
 
   // Trigger downscale preview when dimensions change
   useEffect(() => {
@@ -269,7 +276,7 @@ export function ImageEditor({
     return () => {
       if (downscaleTimerRef.current) clearTimeout(downscaleTimerRef.current);
     };
-  }, [downscaleState.targetWidth, downscaleState.targetHeight, downscaleState.autoTrim, downscaleState.confirmed, generateDownscalePreview]);
+  }, [downscaleState.targetWidth, downscaleState.targetHeight, downscaleState.autoTrim, downscaleState.confirmed, settings.backgroundEnabled, settings.backgroundTolerance, generateDownscalePreview]);
 
   // Generate post-process preview (debounced)
   const generatePreview = useCallback(async () => {
@@ -282,6 +289,10 @@ export function ImageEditor({
         auto_trim: downscaleState.autoTrim,
         target_width: downscaleState.targetWidth || undefined,
         target_height: downscaleState.targetHeight || undefined,
+      } : null;
+
+      const backgroundSettings = settings.backgroundEnabled ? {
+        tolerance: settings.backgroundTolerance,
       } : null;
 
       const alphaSettings = settings.alphaEnabled ? {
@@ -304,6 +315,7 @@ export function ImageEditor({
       const pngBytes = await invoke<number[]>('generate_preview_command', {
         inputPath: imagePath,
         downscaleSettings,
+        backgroundSettings,
         alphaSettings,
         mergeSettings,
         outlineSettings,
@@ -314,7 +326,7 @@ export function ImageEditor({
       setPreviewData(`data:image/png;base64,${base64}`);
     } catch (err) {
       console.error('Preview generation failed:', err);
-      setPreviewData(null);
+      // Don't clear preview — keep showing last good preview on error
     } finally {
       setPreviewLoading(false);
     }
@@ -324,7 +336,7 @@ export function ImageEditor({
   useEffect(() => {
     if (downscaleState.confirmed) {
       if (previewTimerRef.current) clearTimeout(previewTimerRef.current);
-      previewTimerRef.current = window.setTimeout(generatePreview, 300);
+      previewTimerRef.current = window.setTimeout(generatePreview, 150);
     }
     return () => {
       if (previewTimerRef.current) clearTimeout(previewTimerRef.current);
@@ -432,6 +444,10 @@ export function ImageEditor({
         target_height: settings.downscaleTargetHeight || undefined,
       } : null;
 
+      const backgroundSettings = settings.backgroundEnabled ? {
+        tolerance: settings.backgroundTolerance,
+      } : null;
+
       const alphaSettings = settings.alphaEnabled ? {
         low_cutoff: settings.alphaLowCutoff,
         high_min: settings.alphaHighMin,
@@ -453,6 +469,7 @@ export function ImageEditor({
         inputPath: imagePath,
         outputPath,
         downscaleSettings,
+        backgroundSettings,
         alphaSettings,
         mergeSettings,
         outlineSettings,
@@ -637,14 +654,36 @@ export function ImageEditor({
             </div>
           </div>
 
-          <label className="checkbox-label">
-            <input
-              type="checkbox"
-              checked={downscaleState.autoTrim}
-              onChange={e => setDownscaleState(prev => ({ ...prev, autoTrim: e.target.checked }))}
-            />
-            Auto-trim transparent borders
-          </label>
+          <div className="step-options">
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={downscaleState.autoTrim}
+                onChange={e => setDownscaleState(prev => ({ ...prev, autoTrim: e.target.checked }))}
+              />
+              Auto-trim transparent borders
+            </label>
+
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={settings.backgroundEnabled}
+                onChange={e => updateSettings({ backgroundEnabled: e.target.checked })}
+              />
+              Remove background
+              {settings.backgroundEnabled && (
+                <input
+                  type="range"
+                  min="10"
+                  max="60"
+                  step="5"
+                  value={settings.backgroundTolerance}
+                  onChange={e => updateSettings({ backgroundTolerance: parseInt(e.target.value) })}
+                  style={{ width: '80px', marginLeft: '8px' }}
+                />
+              )}
+            </label>
+          </div>
         </div>
 
         <footer className="editor-footer">
@@ -731,6 +770,31 @@ export function ImageEditor({
           )}
 
           <div className="settings-row">
+            {/* Show bg removal here only for non-upscaled images (upscaled images have it in Step 1) */}
+            {!isAiUpscaled && (
+              <label className="setting">
+                <input
+                  type="checkbox"
+                  checked={settings.backgroundEnabled}
+                  onChange={e => updateSettings({ backgroundEnabled: e.target.checked })}
+                />
+                <span>Remove BG</span>
+                {settings.backgroundEnabled && (
+                  <div className="setting-control">
+                    <input
+                      type="range"
+                      min="10"
+                      max="60"
+                      step="5"
+                      value={settings.backgroundTolerance}
+                      onChange={e => updateSettings({ backgroundTolerance: parseInt(e.target.value) })}
+                    />
+                    <span>{settings.backgroundTolerance}</span>
+                  </div>
+                )}
+              </label>
+            )}
+
             <label className="setting">
               <input
                 type="checkbox"

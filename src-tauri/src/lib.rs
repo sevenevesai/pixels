@@ -13,8 +13,8 @@ use error::Result;
 use packer::{PackerSettings, PackerResult};
 use processor::{
     ProcessorSettings, ProcessorResult,
-    AlphaSettings, MergeSettings, OutlineSettings,
-    MergeResult, OutlineDetectionResult,
+    AlphaSettings, MergeSettings, OutlineSettings, BackgroundSettings,
+    MergeResult, OutlineDetectionResult, BackgroundDetectionResult,
 };
 use downscaler::{DownscalerSettings, DownscaleResult, ManualDownscaleSettings};
 use db::{Database, Project, ProjectSettings};
@@ -157,6 +157,19 @@ async fn detect_outline_command(input_path: String) -> Result<OutlineDetectionRe
     .map_err(|e| error::PixelsError::Processing(format!("Task join error: {}", e)))?
 }
 
+/// Detect if image has a solid-color background
+#[tauri::command]
+async fn detect_background_command(input_path: String) -> Result<BackgroundDetectionResult> {
+    let input = PathBuf::from(input_path);
+
+    tokio::task::spawn_blocking(move || {
+        let img = processor::load_image(&input)?;
+        Ok(processor::detect_background(&img))
+    })
+    .await
+    .map_err(|e| error::PixelsError::Processing(format!("Task join error: {}", e)))?
+}
+
 /// Generate downscale-only preview with manual target dimensions
 /// Returns PNG bytes for live preview without saving
 #[tauri::command]
@@ -165,11 +178,17 @@ async fn downscale_preview_command(
     target_width: u32,
     target_height: u32,
     auto_trim: bool,
+    background_settings: Option<BackgroundSettings>,
 ) -> Result<Vec<u8>> {
     let input = PathBuf::from(input_path);
 
     tokio::task::spawn_blocking(move || {
-        let img = processor::load_image(&input)?;
+        let mut img = processor::load_image(&input)?;
+
+        // Background removal before downscale (removes bg at full res)
+        if let Some(bg) = background_settings {
+            processor::remove_background(&mut img, &bg);
+        }
 
         let settings = ManualDownscaleSettings {
             target_width,
@@ -202,6 +221,7 @@ pub struct PreviewDownscaleSettings {
 async fn generate_preview_command(
     input_path: String,
     downscale_settings: Option<PreviewDownscaleSettings>,
+    background_settings: Option<BackgroundSettings>,
     alpha_settings: Option<AlphaSettings>,
     merge_settings: Option<MergeSettings>,
     outline_settings: Option<OutlineSettings>,
@@ -211,18 +231,21 @@ async fn generate_preview_command(
     tokio::task::spawn_blocking(move || {
         let mut img = processor::load_image(&input)?;
 
-        // Downscale first (if enabled)
+        // Background removal FIRST (before downscale so bg color doesn't
+        // bleed into sprite edge pixels during downsampling)
+        if let Some(settings) = background_settings {
+            processor::remove_background(&mut img, &settings);
+        }
+
+        // Downscale (if enabled)
         if let Some(ds_settings) = downscale_settings {
             if ds_settings.enabled {
-                // Check if manual dimensions are provided
                 if let (Some(target_w), Some(target_h)) = (ds_settings.target_width, ds_settings.target_height) {
-                    // Use manual dimensions
                     if ds_settings.auto_trim {
                         img = downscaler::auto_trim_image(&img);
                     }
                     img = downscaler::downscale_to_dimensions(&img, target_w, target_h);
                 } else {
-                    // Use auto-detection
                     if ds_settings.auto_trim {
                         img = downscaler::auto_trim_image(&img);
                     }
@@ -235,7 +258,7 @@ async fn generate_preview_command(
             }
         }
 
-        // Apply post-processing operations in order (if settings provided)
+        // Post-processing
         if let Some(settings) = alpha_settings {
             processor::normalize_alpha(&mut img, &settings);
         }
@@ -258,6 +281,7 @@ async fn process_and_save_command(
     input_path: String,
     output_path: String,
     downscale_settings: Option<PreviewDownscaleSettings>,
+    background_settings: Option<BackgroundSettings>,
     alpha_settings: Option<AlphaSettings>,
     merge_settings: Option<MergeSettings>,
     outline_settings: Option<OutlineSettings>,
@@ -268,18 +292,20 @@ async fn process_and_save_command(
     tokio::task::spawn_blocking(move || {
         let mut img = processor::load_image(&input)?;
 
-        // Downscale first (if enabled)
+        // Background removal FIRST
+        if let Some(settings) = background_settings {
+            processor::remove_background(&mut img, &settings);
+        }
+
+        // Downscale (if enabled)
         if let Some(ds_settings) = downscale_settings {
             if ds_settings.enabled {
-                // Check if manual dimensions are provided
                 if let (Some(target_w), Some(target_h)) = (ds_settings.target_width, ds_settings.target_height) {
-                    // Use manual dimensions
                     if ds_settings.auto_trim {
                         img = downscaler::auto_trim_image(&img);
                     }
                     img = downscaler::downscale_to_dimensions(&img, target_w, target_h);
                 } else {
-                    // Use auto-detection
                     if ds_settings.auto_trim {
                         img = downscaler::auto_trim_image(&img);
                     }
@@ -292,7 +318,7 @@ async fn process_and_save_command(
             }
         }
 
-        // Apply post-processing operations in order (if settings provided)
+        // Post-processing
         if let Some(settings) = alpha_settings {
             processor::normalize_alpha(&mut img, &settings);
         }
@@ -488,6 +514,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // Initialize database
             let app_dir = app.path().app_data_dir()
@@ -513,6 +541,7 @@ pub fn run() {
             merge_colors_command,
             add_outline_command,
             detect_outline_command,
+            detect_background_command,
             downscale_preview_command,
             generate_preview_command,
             process_and_save_command,

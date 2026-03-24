@@ -1,7 +1,8 @@
 //! AI Pixel Art Downscaler
 //!
 //! Detects the true pixel grid in AI-generated pixel art and downscales
-//! to the actual resolution. Uses FFT for grid detection and block variance
+//! to the actual resolution. Uses edge consistency profiles with Harmonic
+//! Product Spectrum (HPS) analysis for grid detection, and block variance
 //! with phase search for optimal alignment.
 
 use image::{RgbaImage, Rgba, ImageBuffer};
@@ -165,134 +166,250 @@ fn fft_detect_period(signal: &[f32], min_period: f32, max_period: f32) -> Option
 }
 
 // ============================================================================
-// BLOCK VARIANCE + PHASE SEARCH (v4 Algorithm)
+// SCALE DETECTION v5: Edge Profile Autocorrelation
 // ============================================================================
+//
+// AI-upscaled pixel art has a periodic grid structure. The edge profile
+// (sum of color differences at each row/column) should be periodic with
+// period = true scale factor.
+//
+// We compute RGB edge profiles, then for each candidate scale S:
+// 1. Autocorrelation at lag S: how periodic is the edge profile at this interval?
+// 2. Phase search via block variance: find the grid alignment within the image
+// 3. Divisor analysis: prefer fundamental frequency over harmonics (S over 2S)
 
 /// Result of scale detection for a single scale
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct ScaleResult {
     scale: u32,
     phase_x: u32,
     phase_y: u32,
     variance: f32,
+    /// Autocorrelation-based periodicity score (higher = stronger grid)
+    edge_score: f32,
 }
 
-/// Calculate block variance at given scale and phase offset
-/// Uses center region to avoid edge artifacts
-/// Samples up to MAX_SAMPLE_BLOCKS for performance on large images
-fn calculate_block_variance(img: &RgbaImage, scale: u32, phase_x: u32, phase_y: u32) -> f32 {
-    const MAX_SAMPLE_BLOCKS: u32 = 400; // Sample at most 400 blocks (20x20 grid)
-
+/// Compute edge CONSISTENCY profiles for horizontal and vertical directions.
+///
+/// Instead of summing edge magnitudes (which are dominated by strong content
+/// edges), this counts what FRACTION of rows/columns have ANY edge at each
+/// position, using a low threshold.
+///
+/// At true grid boundaries, most rows have at least a subtle color change
+/// (even between same-colored blocks, AI upscalers create slight blurring).
+/// At positions within blocks, very few rows have any change.
+///
+/// This makes the profile specific to grid structure regardless of content.
+///
+/// H[x] = fraction of rows where |pixel(x,y) - pixel(x-1,y)| > threshold
+/// V[y] = fraction of columns where |pixel(x,y) - pixel(x,y-1)| > threshold
+fn compute_edge_profiles(img: &RgbaImage) -> (Vec<f32>, Vec<f32>) {
     let (width, height) = img.dimensions();
 
-    // Use center region (middle 2/3) to avoid edge artifacts
-    let margin_y = height / 6;
-    let margin_x = width / 6;
+    // Very low threshold: detect even the most subtle AI blurring at grid
+    // boundaries. Within blocks, pixel values are nearly identical (diff 0-1).
+    // At grid boundaries, even between same-colored blocks, AI creates slight
+    // color variations (diff 2-5+). Using threshold=2 maximizes sensitivity.
+    let threshold = 2.0f32;
 
-    let region_x_start = margin_x;
-    let region_x_end = width - margin_x;
-    let region_y_start = margin_y;
-    let region_y_end = height - margin_y;
+    let mut h_profile = vec![0.0f32; width as usize];
+    let mut v_profile = vec![0.0f32; height as usize];
 
-    let region_width = region_x_end - region_x_start;
-    let region_height = region_y_end - region_y_start;
+    // Count of valid (opaque) pixel pairs per column/row for normalization
+    let mut h_count = vec![0u32; width as usize];
+    let mut v_count = vec![0u32; height as usize];
 
-    // Adjust phase within the region
-    let adj_px = phase_x % scale;
-    let adj_py = phase_y % scale;
-
-    let n_blocks_x = (region_width.saturating_sub(adj_px)) / scale;
-    let n_blocks_y = (region_height.saturating_sub(adj_py)) / scale;
-
-    if n_blocks_x < 2 || n_blocks_y < 2 {
-        return f32::MAX;
-    }
-
-    // Calculate step size for sampling (sample evenly distributed blocks)
-    let total_blocks = n_blocks_x * n_blocks_y;
-    let step = if total_blocks > MAX_SAMPLE_BLOCKS {
-        ((total_blocks as f32 / MAX_SAMPLE_BLOCKS as f32).sqrt().ceil() as u32).max(1)
-    } else {
-        1
-    };
-
-    let mut total_variance = 0.0f32;
-    let mut block_count = 0u32;
-
-    let mut block_y = 0;
-    while block_y < n_blocks_y {
-        let mut block_x = 0;
-        while block_x < n_blocks_x {
-            let start_x = region_x_start + adj_px + block_x * scale;
-            let start_y = region_y_start + adj_py + block_y * scale;
-
-            // Collect RGB values in this block
-            let mut r_sum = 0.0f32;
-            let mut g_sum = 0.0f32;
-            let mut b_sum = 0.0f32;
-            let mut pixel_count = 0u32;
-
-            for dy in 0..scale {
-                for dx in 0..scale {
-                    let x = start_x + dx;
-                    let y = start_y + dy;
-
-                    if x < width && y < height {
-                        let pixel = img.get_pixel(x, y);
-                        r_sum += pixel[0] as f32;
-                        g_sum += pixel[1] as f32;
-                        b_sum += pixel[2] as f32;
-                        pixel_count += 1;
-                    }
+    // Horizontal: for each column x, count rows where there's an edge
+    for y in 0..height {
+        for x in 1..width {
+            let p = img.get_pixel(x, y);
+            let q = img.get_pixel(x - 1, y);
+            if p[3] > 128 && q[3] > 128 {
+                h_count[x as usize] += 1;
+                let dr = (p[0] as f32 - q[0] as f32).abs();
+                let dg = (p[1] as f32 - q[1] as f32).abs();
+                let db = (p[2] as f32 - q[2] as f32).abs();
+                let max_diff = dr.max(dg).max(db);
+                if max_diff > threshold {
+                    h_profile[x as usize] += 1.0;
                 }
             }
-
-            if pixel_count > 0 {
-                let r_mean = r_sum / pixel_count as f32;
-                let g_mean = g_sum / pixel_count as f32;
-                let b_mean = b_sum / pixel_count as f32;
-
-                // Calculate variance within block
-                let mut variance = 0.0f32;
-                for dy in 0..scale {
-                    for dx in 0..scale {
-                        let x = start_x + dx;
-                        let y = start_y + dy;
-
-                        if x < width && y < height {
-                            let pixel = img.get_pixel(x, y);
-                            let dr = pixel[0] as f32 - r_mean;
-                            let dg = pixel[1] as f32 - g_mean;
-                            let db = pixel[2] as f32 - b_mean;
-                            variance += dr * dr + dg * dg + db * db;
-                        }
-                    }
-                }
-
-                variance /= (pixel_count * 3) as f32;
-                total_variance += variance;
-                block_count += 1;
-            }
-
-            block_x += step;
         }
-        block_y += step;
     }
 
-    if block_count == 0 {
-        return f32::MAX;
+    // Vertical: for each row y, count columns where there's an edge
+    for y in 1..height {
+        for x in 0..width {
+            let p = img.get_pixel(x, y);
+            let q = img.get_pixel(x, y - 1);
+            if p[3] > 128 && q[3] > 128 {
+                v_count[y as usize] += 1;
+                let dr = (p[0] as f32 - q[0] as f32).abs();
+                let dg = (p[1] as f32 - q[1] as f32).abs();
+                let db = (p[2] as f32 - q[2] as f32).abs();
+                let max_diff = dr.max(dg).max(db);
+                if max_diff > threshold {
+                    v_profile[y as usize] += 1.0;
+                }
+            }
+        }
     }
 
-    total_variance / block_count as f32
+    // Normalize to fractions (0.0 - 1.0)
+    for x in 0..width as usize {
+        if h_count[x] > 0 {
+            h_profile[x] /= h_count[x] as f32;
+        }
+    }
+    for y in 0..height as usize {
+        if v_count[y] > 0 {
+            v_profile[y] /= v_count[y] as f32;
+        }
+    }
+
+    (h_profile, v_profile)
 }
 
-/// Find best phase offset for a given scale
+/// Compute normalized autocorrelation of a profile at a specific lag.
+/// Uses the center region to avoid edge artifacts.
+fn autocorrelation_at_lag(profile: &[f32], lag: usize) -> f32 {
+    let n = profile.len();
+    if lag >= n / 2 || n < 20 {
+        return 0.0;
+    }
+
+    // Use center 3/4 to avoid edge artifacts
+    let margin = n / 8;
+    let start = margin;
+    let end = n - margin - lag;
+
+    if end <= start {
+        return 0.0;
+    }
+
+    // Subtract local mean for proper correlation
+    let region = &profile[start..end + lag];
+    let mean: f32 = region.iter().sum::<f32>() / region.len() as f32;
+
+    let mut numerator = 0.0f64;
+    let mut denom_a = 0.0f64;
+    let mut denom_b = 0.0f64;
+
+    for i in start..end {
+        let a = (profile[i] - mean) as f64;
+        let b = (profile[i + lag] - mean) as f64;
+        numerator += a * b;
+        denom_a += a * a;
+        denom_b += b * b;
+    }
+
+    let denom = (denom_a * denom_b).sqrt();
+    if denom < 1e-10 {
+        return 0.0;
+    }
+
+    (numerator / denom) as f32
+}
+
+/// Compute Harmonic Product Spectrum score for a candidate scale.
+/// For period S, checks FFT power at frequencies k/S for k=1,2,3,...
+/// The true fundamental frequency accumulates power from all its harmonics.
+fn harmonic_product_score(fft_magnitudes: &[f32], n: usize, scale: u32) -> f32 {
+    if scale < 2 || n < 4 {
+        return 0.0;
+    }
+
+    let max_harmonics = 6;
+    let mut total_power = 0.0f64;
+    let mut harmonic_count = 0;
+
+    for k in 1..=max_harmonics {
+        // Frequency index for the k-th harmonic of period S
+        let freq_idx_f = (k as f64 * n as f64) / scale as f64;
+        let freq_idx = freq_idx_f.round() as usize;
+
+        if freq_idx >= n / 2 || freq_idx == 0 {
+            break;
+        }
+
+        // Sample a small window around the peak (±1 bin) to handle spectral leakage
+        let lo = freq_idx.saturating_sub(1);
+        let hi = (freq_idx + 2).min(n / 2);
+        let mut best_mag = 0.0f32;
+        for i in lo..hi {
+            best_mag = best_mag.max(fft_magnitudes[i]);
+        }
+
+        // Weight lower harmonics more (fundamental is most important)
+        let weight = 1.0 / k as f64;
+        total_power += best_mag as f64 * weight;
+        harmonic_count += 1;
+    }
+
+    if harmonic_count == 0 {
+        return 0.0;
+    }
+
+    (total_power / harmonic_count as f64) as f32
+}
+
+/// Compute FFT magnitude spectrum from an edge profile
+fn compute_fft_magnitudes(profile: &[f32]) -> Vec<f32> {
+    let n = profile.len();
+    if n < 20 {
+        return Vec::new();
+    }
+
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(n);
+
+    let mean: f32 = profile.iter().sum::<f32>() / n as f32;
+    let mut buffer: Vec<Complex<f32>> = profile
+        .iter()
+        .map(|&x| Complex::new(x - mean, 0.0))
+        .collect();
+
+    fft.process(&mut buffer);
+
+    buffer.iter().map(|c| c.norm()).collect()
+}
+
+/// Combined scale scoring using multiple signals:
+/// 1. Harmonic Product Spectrum (FFT-based, handles sparse edges well)
+/// 2. Autocorrelation (confirms periodicity directly)
+/// 3. Block variance (lower = better grid alignment)
+fn combined_score_for_scale(
+    h_profile: &[f32],
+    v_profile: &[f32],
+    h_fft: &[f32],
+    v_fft: &[f32],
+    scale: u32,
+) -> f32 {
+    let h_n = h_profile.len();
+    let v_n = v_profile.len();
+
+    // HPS score (averaged across H and V)
+    let hps_h = harmonic_product_score(h_fft, h_n, scale);
+    let hps_v = harmonic_product_score(v_fft, v_n, scale);
+    let hps = (hps_h + hps_v) / 2.0;
+
+    // Autocorrelation score
+    let lag = scale as usize;
+    let ac_h = autocorrelation_at_lag(h_profile, lag);
+    let ac_v = autocorrelation_at_lag(v_profile, lag);
+    let ac = ((ac_h + ac_v) / 2.0).max(0.0);
+
+    // Combined: HPS is the primary signal, autocorrelation provides confirmation
+    hps + ac * hps * 0.5
+}
+
+/// Find the best phase for a given scale using block variance minimization.
 fn find_best_phase_for_scale(img: &RgbaImage, scale: u32) -> (u32, u32, f32) {
     let mut best_var = f32::MAX;
     let mut best_px = 0u32;
     let mut best_py = 0u32;
 
-    // Coarse search first
     let step = (scale / 3).max(1);
 
     let mut py = 0;
@@ -312,13 +429,13 @@ fn find_best_phase_for_scale(img: &RgbaImage, scale: u32) -> (u32, u32, f32) {
 
     // Fine-tune around best
     if step > 1 {
-        let search_start_y = best_py.saturating_sub(step);
-        let search_end_y = (best_py + step + 1).min(scale);
-        let search_start_x = best_px.saturating_sub(step);
-        let search_end_x = (best_px + step + 1).min(scale);
+        let sy = best_py.saturating_sub(step);
+        let ey = (best_py + step + 1).min(scale);
+        let sx = best_px.saturating_sub(step);
+        let ex = (best_px + step + 1).min(scale);
 
-        for py in search_start_y..search_end_y {
-            for px in search_start_x..search_end_x {
+        for py in sy..ey {
+            for px in sx..ex {
                 let var = calculate_block_variance(img, scale, px, py);
                 if var < best_var {
                     best_var = var;
@@ -332,98 +449,158 @@ fn find_best_phase_for_scale(img: &RgbaImage, scale: u32) -> (u32, u32, f32) {
     (best_px, best_py, best_var)
 }
 
-/// Find optimal scale using block variance + phase search
-/// Returns (scale, phase_x, phase_y, all_results) - includes results for confidence calculation
-fn find_optimal_scale_v4_with_results(img: &RgbaImage, grid_hint: Option<f32>) -> (u32, u32, u32, Vec<ScaleResult>) {
-    let min_scale = 6u32;
+/// Calculate block variance at given scale and phase offset.
+/// Measures how uniform each NxN block is (lower = better grid alignment).
+fn calculate_block_variance(img: &RgbaImage, scale: u32, phase_x: u32, phase_y: u32) -> f32 {
+    let (width, height) = img.dimensions();
+
+    // Center region to avoid edge artifacts
+    let margin_x = width / 6;
+    let margin_y = height / 6;
+    let rx_start = margin_x;
+    let rx_end = width - margin_x;
+    let ry_start = margin_y;
+    let ry_end = height - margin_y;
+
+    let adj_px = phase_x % scale;
+    let adj_py = phase_y % scale;
+
+    let n_bx = (rx_end - rx_start).saturating_sub(adj_px) / scale;
+    let n_by = (ry_end - ry_start).saturating_sub(adj_py) / scale;
+
+    if n_bx < 2 || n_by < 2 {
+        return f32::MAX;
+    }
+
+    let step = ((n_bx * n_by) as f32 / 400.0).sqrt().ceil().max(1.0) as u32;
+    let mut total_var = 0.0f32;
+    let mut count = 0u32;
+
+    let mut by = 0;
+    while by < n_by {
+        let mut bx = 0;
+        while bx < n_bx {
+            let sx = rx_start + adj_px + bx * scale;
+            let sy = ry_start + adj_py + by * scale;
+            let mut r_sum = 0.0f32;
+            let mut g_sum = 0.0f32;
+            let mut b_sum = 0.0f32;
+            let mut pc = 0u32;
+            for dy in 0..scale {
+                for dx in 0..scale {
+                    let x = sx + dx;
+                    let y = sy + dy;
+                    if x < width && y < height {
+                        let p = img.get_pixel(x, y);
+                        if p[3] > 128 {
+                            r_sum += p[0] as f32;
+                            g_sum += p[1] as f32;
+                            b_sum += p[2] as f32;
+                            pc += 1;
+                        }
+                    }
+                }
+            }
+            if pc > 1 {
+                let rm = r_sum / pc as f32;
+                let gm = g_sum / pc as f32;
+                let bm = b_sum / pc as f32;
+                let mut v = 0.0f32;
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let x = sx + dx;
+                        let y = sy + dy;
+                        if x < width && y < height {
+                            let p = img.get_pixel(x, y);
+                            if p[3] > 128 {
+                                let dr = p[0] as f32 - rm;
+                                let dg = p[1] as f32 - gm;
+                                let db = p[2] as f32 - bm;
+                                v += dr * dr + dg * dg + db * db;
+                            }
+                        }
+                    }
+                }
+                total_var += v / (pc * 3) as f32;
+                count += 1;
+            }
+            bx += step;
+        }
+        by += step;
+    }
+
+    if count == 0 { f32::MAX } else { total_var / count as f32 }
+}
+
+/// Find optimal scale using v5 algorithm (edge consistency + HPS + autocorrelation)
+/// Returns (scale, phase_x, phase_y, all_results)
+fn find_optimal_scale_v4_with_results(img: &RgbaImage, _grid_hint: Option<f32>) -> (u32, u32, u32, Vec<ScaleResult>) {
+    let min_scale = 4u32;
     let max_scale = 20u32;
 
+    // Step 1: Compute edge profiles (one-time cost)
+    let (h_profile, v_profile) = compute_edge_profiles(img);
+
+    // Step 2: Compute FFT magnitudes (one-time)
+    let h_fft = compute_fft_magnitudes(&h_profile);
+    let v_fft = compute_fft_magnitudes(&v_profile);
+
+    // Step 3: Score each candidate scale using combined HPS + autocorrelation
     let mut all_results: Vec<ScaleResult> = Vec::new();
 
-    // If we have an FFT hint, prioritize scales near it for faster detection
-    let scales_to_test: Vec<u32> = if let Some(hint) = grid_hint {
-        // Test hint scale and nearby first, then expand
-        let hint_scale = hint.round() as u32;
-        let mut scales: Vec<u32> = Vec::new();
-
-        // Add hint and immediate neighbors first (most likely to be correct)
-        for offset in 0..=2i32 {
-            let s = (hint_scale as i32 + offset).clamp(min_scale as i32, max_scale as i32) as u32;
-            if !scales.contains(&s) { scales.push(s); }
-            let s = (hint_scale as i32 - offset).clamp(min_scale as i32, max_scale as i32) as u32;
-            if !scales.contains(&s) { scales.push(s); }
-        }
-
-        // Add remaining scales
-        for s in min_scale..=max_scale {
-            if !scales.contains(&s) { scales.push(s); }
-        }
-        scales
-    } else {
-        (min_scale..=max_scale).collect()
-    };
-
-    // Test scales
-    for scale in scales_to_test {
+    for scale in min_scale..=max_scale {
+        let score = combined_score_for_scale(&h_profile, &v_profile, &h_fft, &v_fft, scale);
         let (px, py, var) = find_best_phase_for_scale(img, scale);
         all_results.push(ScaleResult {
             scale,
             phase_x: px,
             phase_y: py,
             variance: var,
+            edge_score: score,
         });
     }
 
-    // Sort by scale for consistent ordering
     all_results.sort_by_key(|r| r.scale);
 
-    // Find minimum variance
-    let min_var = all_results
-        .iter()
-        .map(|r| r.variance)
-        .fold(f32::MAX, f32::min);
+    // Step 4: Select best scale with divisor preference.
+    let max_score = all_results.iter().map(|r| r.edge_score).fold(0.0f32, f32::max);
 
-    if min_var == f32::MAX {
-        // Fallback to grid hint or default
-        let scale = grid_hint.map(|g| g.round() as u32).unwrap_or(10);
-        return (scale.clamp(min_scale, max_scale), 0, 0, all_results);
+    if max_score <= 0.0 {
+        return (8, 0, 0, all_results);
     }
 
-    // Find all "valid" scales (variance within 2x of minimum)
-    let threshold = min_var * 2.0;
-    let valid_scales: Vec<&ScaleResult> = all_results
+    // Candidates: within 80% of max score
+    let threshold = max_score * 0.80;
+    let mut candidates: Vec<&ScaleResult> = all_results
         .iter()
-        .filter(|r| r.variance <= threshold)
+        .filter(|r| r.edge_score >= threshold)
         .collect();
+    candidates.sort_by_key(|r| r.scale);
 
-    let best = if valid_scales.is_empty() {
-        // Fallback to minimum variance
+    let best = if candidates.is_empty() {
         all_results
             .iter()
-            .min_by(|a, b| a.variance.partial_cmp(&b.variance).unwrap())
-            .unwrap()
-    } else if let Some(hint) = grid_hint {
-        // Prefer scale closest to FFT hint among valid scales
-        valid_scales
-            .iter()
-            .min_by(|a, b| {
-                let dist_a = (a.scale as f32 - hint).abs();
-                let dist_b = (b.scale as f32 - hint).abs();
-                dist_a.partial_cmp(&dist_b).unwrap()
-            })
+            .max_by(|a, b| a.edge_score.partial_cmp(&b.edge_score).unwrap())
             .unwrap()
     } else {
-        // Take largest valid scale
-        valid_scales
-            .iter()
-            .max_by_key(|r| r.scale)
-            .unwrap()
+        // Among candidates, prefer smallest (fundamental frequency).
+        // But if a larger candidate scores much better, pick that instead
+        // (unless the smaller one divides it evenly — then it's a harmonic).
+        let mut pick = candidates[0];
+
+        for c in &candidates[1..] {
+            if c.edge_score > pick.edge_score * 1.20 && c.scale % pick.scale != 0 {
+                pick = c;
+            }
+        }
+
+        pick
     };
 
     (best.scale, best.phase_x, best.phase_y, all_results)
 }
 
-/// Find optimal scale using block variance + phase search
+/// Find optimal scale using v5 algorithm
 /// Returns (scale, phase_x, phase_y)
 fn find_optimal_scale_v4(img: &RgbaImage, grid_hint: Option<f32>) -> (u32, u32, u32) {
     let (scale, px, py, _) = find_optimal_scale_v4_with_results(img, grid_hint);
@@ -601,27 +778,33 @@ pub fn detect_scale(input_path: PathBuf) -> Result<ScaleDetectionResult> {
     // Trim for accurate detection (same as downscale_image does)
     let trimmed = auto_trim(&rgba);
 
-    // Detect grid using FFT
+    // Find optimal scale using v5 algorithm (edge consistency + HPS)
     let grid_hint = detect_grid_size(&trimmed);
-
-    // Find optimal scale and get all variance results (reused for confidence)
     let (scale, _phase_x, _phase_y, all_results) = find_optimal_scale_v4_with_results(&trimmed, grid_hint);
 
-    // Calculate confidence from the already-computed variance results
-    let min_var = all_results.iter().map(|r| r.variance).fold(f32::MAX, f32::min);
-    let max_var = all_results.iter().map(|r| r.variance).fold(0.0f32, f32::max);
+    // Calculate confidence from edge_score separation:
+    // High confidence = detected scale's edge_score is much higher than alternatives
+    let detected_edge = all_results.iter().find(|r| r.scale == scale).map(|r| r.edge_score).unwrap_or(0.0);
+    let mut other_scores: Vec<f32> = all_results.iter()
+        .filter(|r| r.scale != scale)
+        .map(|r| r.edge_score)
+        .collect();
+    other_scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    let second_best = other_scores.first().copied().unwrap_or(0.0);
 
-    // Confidence: how much better is our detected scale vs alternatives
-    let detected_var = all_results.iter().find(|r| r.scale == scale).map(|r| r.variance).unwrap_or(min_var);
-    let confidence = if max_var > min_var {
-        1.0 - (detected_var - min_var) / (max_var - min_var)
+    let confidence = if detected_edge > 0.0 && second_best > 0.0 {
+        // Ratio-based confidence: how much better is our pick vs runner-up
+        let ratio = detected_edge / second_best;
+        // ratio=1.0 → 0.0 confidence, ratio=2.0 → 0.6, ratio=3.0 → 0.8, ratio=5.0 → 0.9
+        (1.0 - 1.0 / ratio).clamp(0.0, 1.0)
+    } else if detected_edge > 0.0 {
+        0.8
     } else {
-        0.5 // Can't determine confidence
+        0.0
     };
 
-    // Consider it AI-upscaled if scale > 1 and we have reasonable confidence
-    // Also check if grid was detected via FFT
-    let is_ai_upscaled = scale > 1 && (grid_hint.is_some() || confidence > 0.6);
+    // Consider it AI-upscaled if scale > 1 and we have some confidence
+    let is_ai_upscaled = scale > 1 && confidence > 0.1;
 
     // Estimate native size
     let estimated_native_size = if scale > 1 {
@@ -719,5 +902,86 @@ mod tests {
         let img: RgbaImage = ImageBuffer::from_pixel(100, 100, Rgba([128, 128, 128, 255]));
         let var = calculate_block_variance(&img, 10, 0, 0);
         assert!(var < 0.1, "Uniform image should have near-zero variance");
+    }
+
+    #[test]
+    fn diagnostic_test_all_images() {
+        let test_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("downscale_tests");
+        let input_dir = test_dir.join("input");
+        let expected_dir = test_dir.join("expected");
+
+        let test_cases = vec![
+            ("chair-1.png", "downscaled-chair-1.png"),
+            ("greenhouse-original.png", "greenhouse-downscaled-python.png"),
+            ("grindstone-original.png", "grindstone-downscaled-python.png"),
+            ("snowman-original.png", "snowman-downscaled.png"),
+            ("truck-original.png", "truck-downscaled-python.png"),
+        ];
+
+        println!("\n{}", "=".repeat(60));
+        println!("DOWNSCALER DIAGNOSTIC REPORT");
+        println!("{}", "=".repeat(60));
+
+        for (input_name, expected_name) in &test_cases {
+            let input_path = input_dir.join(input_name);
+            let expected_path = expected_dir.join(expected_name);
+
+            if !input_path.exists() {
+                println!("\n[SKIP] {} - file not found", input_name);
+                continue;
+            }
+
+            let img = image::open(&input_path).unwrap().to_rgba8();
+            let (w, h) = img.dimensions();
+
+            // Load expected to get target dimensions
+            let expected_dims = if expected_path.exists() {
+                let exp = image::open(&expected_path).unwrap().to_rgba8();
+                Some(exp.dimensions())
+            } else {
+                None
+            };
+
+            // Trim (same as detect_scale does)
+            let trimmed = auto_trim(&img);
+            let (tw, th) = trimmed.dimensions();
+
+            // FFT detection
+            let grid_hint = detect_grid_size(&trimmed);
+
+            // Block variance detection (current algorithm: scales 6-20)
+            let (scale, px, py, all_results) = find_optimal_scale_v4_with_results(&trimmed, grid_hint);
+
+            // What dimensions would we get?
+            let detected_out_w = tw / scale;
+            let detected_out_h = th / scale;
+
+            // Calculate what scale SHOULD be based on expected
+            let ideal_scale = expected_dims.map(|(ew, _eh)| {
+                (tw as f32 / ew as f32).round() as u32
+            });
+
+            println!("\n--- {} ---", input_name);
+            println!("  Input:       {}x{}", w, h);
+            println!("  Trimmed:     {}x{}", tw, th);
+            println!("  FFT hint:    {:?}", grid_hint);
+            println!("  Detected:    scale={}, phase=({},{})", scale, px, py);
+            println!("  Output dims: {}x{}", detected_out_w, detected_out_h);
+            if let Some((ew, eh)) = expected_dims {
+                println!("  Expected:    {}x{}", ew, eh);
+                println!("  Ideal scale: {:?}", ideal_scale);
+                let correct = detected_out_w == ew && detected_out_h == eh;
+                println!("  MATCH:       {}", if correct { "YES" } else { "NO <<<" });
+            }
+
+            // Print full landscape for all scales
+            println!("  Full landscape (scale: edge, var):");
+            for r in &all_results {
+                let marker = if Some(r.scale) == ideal_scale { " <-- ideal" } else { "" };
+                println!("    scale={:2}: edge={:12.1}, var={:8.2}{}", r.scale, r.edge_score, r.variance, marker);
+            }
+        }
+
+        println!("\n{}", "=".repeat(60));
     }
 }

@@ -29,6 +29,10 @@ export interface ProcessingSettings {
   downscaleTargetWidth: number | null;
   downscaleTargetHeight: number | null;
 
+  // Background removal (after downscale, before alpha)
+  backgroundEnabled: boolean;
+  backgroundTolerance: number;
+
   // Alpha normalization
   alphaEnabled: boolean;
   alphaLowCutoff: number;
@@ -73,6 +77,9 @@ export const DEFAULT_SETTINGS: ProcessingSettings = {
   downscaleTargetWidth: null,  // null = use auto-detection
   downscaleTargetHeight: null, // null = use auto-detection
 
+  backgroundEnabled: false,
+  backgroundTolerance: 30,
+
   alphaEnabled: true,
   alphaLowCutoff: 200,
   alphaHighMin: 200,
@@ -116,6 +123,13 @@ export interface WorkspaceState {
   isProcessing: boolean;
   /** Processing progress message */
   progressMessage: string;
+}
+
+export interface BackgroundDetectionResult {
+  has_background: boolean;
+  background_color: [number, number, number] | null;
+  confidence: number;
+  edge_pixel_count: number;
 }
 
 export interface OutlineDetectionResult {
