@@ -47,3 +47,7 @@ opt-level = 2  # Enable optimizations in dev mode
 [profile.dev.package."*"]
 opt-level = 2  # Optimize dependencies even in dev mode
 
+# Release profile: don't strip symbols (required for Tauri updater patching)
+[profile.release]
+strip = false
+
