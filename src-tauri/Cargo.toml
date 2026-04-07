@@ -1,6 +1,6 @@
 [package]
 name = "pixels-toolkit"
-version = "1.1.0"
+version = "1.1.1"
 description = "Image processing and sprite sheet packing tool for pixel art"
 authors = ["SeveNeves"]
 edition = "2021"
