@@ -204,26 +204,20 @@ export function ImageEditor({
         const isUpscaled = result.is_ai_upscaled && result.detected_scale > 1;
         setIsAiUpscaled(isUpscaled);
 
-        if (isUpscaled) {
-          setDownscaleState({
-            originalWidth: result.dimensions[0],
-            originalHeight: result.dimensions[1],
-            detectedScale: result.detected_scale,
-            targetWidth: result.estimated_native_size[0],
-            targetHeight: result.estimated_native_size[1],
-            autoTrim: true,
-            confirmed: false,
-            previewData: null,
-            previewLoading: false,
-          });
-        } else {
-          // Not AI upscaled, skip downscale step
-          setDownscaleState(prev => ({ ...prev, confirmed: true }));
-        }
+        setDownscaleState({
+          originalWidth: result.dimensions[0],
+          originalHeight: result.dimensions[1],
+          detectedScale: result.detected_scale,
+          targetWidth: isUpscaled ? result.estimated_native_size[0] : result.dimensions[0],
+          targetHeight: isUpscaled ? result.estimated_native_size[1] : result.dimensions[1],
+          autoTrim: true,
+          confirmed: false,
+          previewData: null,
+          previewLoading: false,
+        });
       } catch (err) {
         console.error('Scale detection failed:', err);
         setIsAiUpscaled(false);
-        setDownscaleState(prev => ({ ...prev, confirmed: true }));
       } finally {
         if (!cancelled) setDetectionLoading(false);
       }
@@ -574,14 +568,15 @@ export function ImageEditor({
     );
   }
 
-  // Render downscale step (if needed and not confirmed)
-  if (isAiUpscaled && !downscaleState.confirmed) {
+  // Render downscale step (always shown first, user decides to downscale or skip)
+  if (!downscaleState.confirmed) {
     return (
       <div className="image-editor">
         <header className="editor-header">
           <div className="editor-title">
             <h2>{imageName}</h2>
-            <span className="badge ai">AI Upscaled {downscaleState.detectedScale}x</span>
+            {isAiUpscaled && <span className="badge ai">AI Upscaled {downscaleState.detectedScale}x</span>}
+            {!isAiUpscaled && <span className="badge">{downscaleState.originalWidth} x {downscaleState.originalHeight}</span>}
           </div>
           <button onClick={onClose} className="btn-close">Close</button>
         </header>
@@ -589,7 +584,7 @@ export function ImageEditor({
         <div className="editor-content">
           <div className="step-header">
             <h3>Step 1: Downscale</h3>
-            <p>Reduce to native pixel art resolution</p>
+            <p>{isAiUpscaled ? 'Reduce to native pixel art resolution' : 'Adjust dimensions if needed, or skip to post-processing'}</p>
           </div>
 
           <div className="preview-row">

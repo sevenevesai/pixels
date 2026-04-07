@@ -190,16 +190,6 @@ export function WorkspaceV3() {
             <button onClick={openFolder} className="btn">Open Folder</button>
             <button onClick={openImage} className="btn">Open Image</button>
           </div>
-          <div className="header-right">
-            <a
-              href="https://www.paypal.com/donate/?hosted_button_id=XJUQUE78JATMN"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="donate-link"
-            >
-              Donate
-            </a>
-          </div>
         </header>
 
         <div className="workspace-empty">
@@ -227,16 +217,6 @@ export function WorkspaceV3() {
             <button onClick={openFolder} className="btn">Open Folder</button>
             <button onClick={openImage} className="btn">Open Image</button>
           </div>
-          <div className="header-right">
-            <a
-              href="https://www.paypal.com/donate/?hosted_button_id=XJUQUE78JATMN"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="donate-link"
-            >
-              Donate
-            </a>
-          </div>
         </header>
 
         <ImageEditor
@@ -262,16 +242,6 @@ export function WorkspaceV3() {
         <div className="workspace-actions">
           <button onClick={openFolder} className="btn">Open Folder</button>
           <button onClick={openImage} className="btn">Open Image</button>
-        </div>
-        <div className="header-right">
-          <a
-            href="https://www.paypal.com/donate/?hosted_button_id=XJUQUE78JATMN"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="donate-link"
-          >
-            Donate
-          </a>
         </div>
       </header>
 

@@ -535,7 +535,7 @@ fn calculate_block_variance(img: &RgbaImage, scale: u32, phase_x: u32, phase_y: 
 /// Find optimal scale using v5 algorithm (edge consistency + HPS + autocorrelation)
 /// Returns (scale, phase_x, phase_y, all_results)
 fn find_optimal_scale_v4_with_results(img: &RgbaImage, _grid_hint: Option<f32>) -> (u32, u32, u32, Vec<ScaleResult>) {
-    let min_scale = 4u32;
+    let min_scale = 3u32;
     let max_scale = 20u32;
 
     // Step 1: Compute edge profiles (one-time cost)
@@ -562,35 +562,72 @@ fn find_optimal_scale_v4_with_results(img: &RgbaImage, _grid_hint: Option<f32>) 
 
     all_results.sort_by_key(|r| r.scale);
 
-    // Step 4: Select best scale with divisor preference.
-    let max_score = all_results.iter().map(|r| r.edge_score).fold(0.0f32, f32::max);
+    // Step 4: Select best scale with variance-aware scoring.
+    //
+    // Edge score alone can produce false positives at high scales (e.g., scale=19
+    // scoring high due to noise). Block variance directly measures grid quality:
+    // true grid alignment produces uniform blocks (low variance), while false
+    // detections at high scales span content boundaries (high variance).
+    //
+    // We use a combined score: edge_score_normalized + variance_rank_bonus.
+    // This ensures a scale can't win on edge score alone if its variance is
+    // much worse than alternatives.
 
-    if max_score <= 0.0 {
+    let max_edge = all_results.iter().map(|r| r.edge_score).fold(0.0f32, f32::max);
+
+    if max_edge <= 0.0 {
         return (8, 0, 0, all_results);
     }
 
-    // Candidates: within 80% of max score
-    let threshold = max_score * 0.80;
-    let mut candidates: Vec<&ScaleResult> = all_results
+    let min_var = all_results.iter().map(|r| r.variance).fold(f32::MAX, f32::min);
+    let max_var = all_results.iter().map(|r| r.variance).fold(0.0f32, f32::max);
+    let var_range = max_var - min_var;
+
+    // Combined score using geometric mean of edge and variance signals.
+    // This heavily penalizes candidates that score well on one dimension
+    // but poorly on the other — a false positive at scale=19 with high
+    // edge score but terrible variance gets suppressed.
+    //
+    // We add a small floor (0.05) to prevent zero edge scores from
+    // completely eliminating otherwise good variance candidates.
+    let combined_scores: Vec<f32> = all_results.iter().map(|r| {
+        let edge_norm = (r.edge_score / max_edge).max(0.05);
+        let var_norm = if var_range > 0.0 {
+            ((max_var - r.variance) / var_range).max(0.05)
+        } else {
+            0.5
+        };
+        (edge_norm * var_norm).sqrt()  // geometric mean
+    }).collect();
+
+    let max_combined = combined_scores.iter().cloned().fold(0.0f32, f32::max);
+
+    // Candidates: within 80% of max combined score
+    let threshold = max_combined * 0.80;
+    let mut candidates: Vec<(usize, &ScaleResult)> = all_results
         .iter()
-        .filter(|r| r.edge_score >= threshold)
+        .enumerate()
+        .filter(|(i, _)| combined_scores[*i] >= threshold)
         .collect();
-    candidates.sort_by_key(|r| r.scale);
+    candidates.sort_by_key(|(_, r)| r.scale);
 
     let best = if candidates.is_empty() {
-        all_results
-            .iter()
-            .max_by(|a, b| a.edge_score.partial_cmp(&b.edge_score).unwrap())
-            .unwrap()
+        // Fallback: pick highest combined score
+        let (best_idx, _) = combined_scores.iter().enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap();
+        &all_results[best_idx]
     } else {
         // Among candidates, prefer smallest (fundamental frequency).
         // But if a larger candidate scores much better, pick that instead
         // (unless the smaller one divides it evenly — then it's a harmonic).
-        let mut pick = candidates[0];
+        let (_, mut pick) = candidates[0];
+        let mut pick_score = combined_scores[candidates[0].0];
 
-        for c in &candidates[1..] {
-            if c.edge_score > pick.edge_score * 1.20 && c.scale % pick.scale != 0 {
+        for &(i, c) in &candidates[1..] {
+            if combined_scores[i] > pick_score * 1.20 && c.scale % pick.scale != 0 {
                 pick = c;
+                pick_score = combined_scores[i];
             }
         }
 
@@ -782,9 +819,13 @@ pub fn detect_scale(input_path: PathBuf) -> Result<ScaleDetectionResult> {
     let grid_hint = detect_grid_size(&trimmed);
     let (scale, _phase_x, _phase_y, all_results) = find_optimal_scale_v4_with_results(&trimmed, grid_hint);
 
-    // Calculate confidence from edge_score separation:
-    // High confidence = detected scale's edge_score is much higher than alternatives
-    let detected_edge = all_results.iter().find(|r| r.scale == scale).map(|r| r.edge_score).unwrap_or(0.0);
+    // Calculate confidence from multiple signals:
+    // 1. Edge score separation (how much better is our pick vs runner-up)
+    // 2. Variance separation (how much lower is our pick's block variance)
+    let detected_result = all_results.iter().find(|r| r.scale == scale);
+    let detected_edge = detected_result.map(|r| r.edge_score).unwrap_or(0.0);
+    let detected_var = detected_result.map(|r| r.variance).unwrap_or(f32::MAX);
+
     let mut other_scores: Vec<f32> = all_results.iter()
         .filter(|r| r.scale != scale)
         .map(|r| r.edge_score)
@@ -792,7 +833,7 @@ pub fn detect_scale(input_path: PathBuf) -> Result<ScaleDetectionResult> {
     other_scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
     let second_best = other_scores.first().copied().unwrap_or(0.0);
 
-    let confidence = if detected_edge > 0.0 && second_best > 0.0 {
+    let edge_confidence = if detected_edge > 0.0 && second_best > 0.0 {
         // Ratio-based confidence: how much better is our pick vs runner-up
         let ratio = detected_edge / second_best;
         // ratio=1.0 → 0.0 confidence, ratio=2.0 → 0.6, ratio=3.0 → 0.8, ratio=5.0 → 0.9
@@ -802,6 +843,30 @@ pub fn detect_scale(input_path: PathBuf) -> Result<ScaleDetectionResult> {
     } else {
         0.0
     };
+
+    // Variance-based confidence: compare detected scale's variance to the median
+    // Low variance relative to others indicates good grid alignment
+    let mut other_variances: Vec<f32> = all_results.iter()
+        .filter(|r| r.scale != scale && r.variance < f32::MAX)
+        .map(|r| r.variance)
+        .collect();
+    other_variances.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median_var = if !other_variances.is_empty() {
+        other_variances[other_variances.len() / 2]
+    } else {
+        detected_var
+    };
+    let variance_confidence = if detected_var > 0.0 && median_var > 0.0 {
+        // If detected variance is much lower than median, high confidence
+        // ratio=1.0 → 0.0, ratio=2.0 → 0.5, ratio=3.0 → 0.67
+        let ratio = median_var / detected_var;
+        (1.0 - 1.0 / ratio).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    // Use whichever signal is stronger
+    let confidence = edge_confidence.max(variance_confidence);
 
     // Consider it AI-upscaled if scale > 1 and we have some confidence
     let is_ai_upscaled = scale > 1 && confidence > 0.1;

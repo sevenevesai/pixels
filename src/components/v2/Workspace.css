@@ -68,24 +68,6 @@
   gap: 0.5rem;
 }
 
-.header-right {
-  margin-left: auto;
-}
-
-.donate-link {
-  color: #ff6b6b;
-  text-decoration: none;
-  font-size: 0.9rem;
-  padding: 0.4rem 0.8rem;
-  border-radius: 4px;
-  background: rgba(255, 107, 107, 0.1);
-  transition: background 0.2s;
-}
-
-.donate-link:hover {
-  background: rgba(255, 107, 107, 0.2);
-}
-
 /* Workspace Path Bar */
 .workspace-path-bar {
   display: flex;
