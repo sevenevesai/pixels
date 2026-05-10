@@ -9,6 +9,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { check } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { ImageEditor } from './ImageEditor';
+import { BulkProcessPanel } from './BulkProcessPanel';
 import './Workspace.css';
 
 // Update checker banner — checks on mount, shows banner if update available
@@ -90,6 +91,7 @@ export function WorkspaceV3() {
     folderImages: [],
     loadingThumbnails: false,
   });
+  const [showBulkPanel, setShowBulkPanel] = useState(false);
 
   // Open single image (quick-edit mode)
   const openImage = useCallback(async () => {
@@ -249,6 +251,13 @@ export function WorkspaceV3() {
         <span className="workspace-label">FOLDER:</span>
         <span className="workspace-path" title={folderPath}>{folderName}</span>
         <span className="workspace-count">({state.folderImages.length} images)</span>
+        <button
+          className="btn-small btn-primary"
+          onClick={() => setShowBulkPanel(true)}
+          disabled={state.folderImages.length === 0}
+        >
+          Bulk Process
+        </button>
         <button className="btn-small" onClick={closeWorkspace}>Close</button>
       </div>
 
@@ -280,9 +289,19 @@ export function WorkspaceV3() {
           </div>
         </aside>
 
-        {/* Main content - image editor or placeholder */}
+        {/* Main content - image editor, bulk panel, or placeholder */}
         <main className="editor-area">
-          {state.currentImage ? (
+          {showBulkPanel ? (
+            <BulkProcessPanel
+              paths={state.folderImages.map(img => img.fullPath)}
+              workspacePath={folderPath}
+              onClose={() => setShowBulkPanel(false)}
+              onComplete={() => {
+                // Refresh all thumbnails after bulk processing
+                loadFolderThumbnails(folderPath, setState);
+              }}
+            />
+          ) : state.currentImage ? (
             <ImageEditor
               imagePath={state.currentImage.path}
               imageName={state.currentImage.name}

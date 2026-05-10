@@ -6,9 +6,10 @@ mod db;
 mod state;
 
 use std::path::PathBuf;
-use std::sync::Mutex;
-use tauri::Manager;
-use serde::Deserialize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tauri::{AppHandle, Emitter, Manager};
+use serde::{Deserialize, Serialize};
 use error::Result;
 use packer::{PackerSettings, PackerResult};
 use processor::{
@@ -336,6 +337,261 @@ async fn process_and_save_command(
 }
 
 // ============================================================================
+// BATCH PROCESSING
+// ============================================================================
+
+#[derive(Clone, Serialize)]
+struct BatchProgressEvent {
+    index: usize,
+    total: usize,
+    current_file: String,
+    status: String, // "processing", "done", "error", "cancelled"
+    error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+struct BatchCompleteEvent {
+    processed: usize,
+    failed: usize,
+    cancelled: bool,
+}
+
+/// Batch process multiple images with shared settings.
+/// Emits "batch-progress" events per file and "batch-complete" when done.
+#[tauri::command]
+async fn batch_process_command(
+    app: AppHandle,
+    paths: Vec<String>,
+    workspace_path: Option<String>,
+    downscale_enabled: bool,
+    background_settings: Option<BackgroundSettings>,
+    alpha_settings: Option<AlphaSettings>,
+    merge_settings: Option<MergeSettings>,
+    outline_settings: Option<OutlineSettings>,
+) -> Result<()> {
+    let cancel_flag = app.state::<Arc<AtomicBool>>();
+    cancel_flag.store(false, Ordering::Relaxed);
+    let cancel = cancel_flag.inner().clone();
+
+    let total = paths.len();
+
+    tokio::task::spawn_blocking(move || {
+        let mut processed = 0usize;
+        let mut failed = 0usize;
+        // Track backup mappings: (original_path, backup_filename)
+        let mut backup_manifest: Vec<(String, String)> = Vec::new();
+
+        for (i, file_path) in paths.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                let _ = app.emit("batch-progress", BatchProgressEvent {
+                    index: i,
+                    total,
+                    current_file: file_path.clone(),
+                    status: "cancelled".into(),
+                    error: None,
+                });
+                let _ = app.emit("batch-complete", BatchCompleteEvent {
+                    processed,
+                    failed,
+                    cancelled: true,
+                });
+                // Write manifest even on cancel (so partial work can be reverted)
+                if let Some(ref ws) = workspace_path {
+                    write_batch_manifest(ws, &backup_manifest);
+                }
+                return Ok(());
+            }
+
+            let _ = app.emit("batch-progress", BatchProgressEvent {
+                index: i,
+                total,
+                current_file: file_path.clone(),
+                status: "processing".into(),
+                error: None,
+            });
+
+            let input = PathBuf::from(file_path);
+
+            // Backup original if workspace provided
+            if let Some(ref ws) = workspace_path {
+                let ws_path = PathBuf::from(ws);
+
+                if let Ok(hash) = state::hash_file(&input) {
+                    let backup_name = format!("{}_original.png", &hash[..16]);
+                    let backup_path = ws_path.join(".pixels").join("cache").join(&backup_name);
+                    if !backup_path.exists() {
+                        let _ = std::fs::copy(&input, &backup_path);
+                    }
+                    backup_manifest.push((file_path.clone(), backup_name));
+                }
+            }
+
+            // Process the image
+            let result = (|| -> error::Result<()> {
+                let mut img = processor::load_image(&input)?;
+
+                // Background removal first
+                if let Some(ref bg) = background_settings {
+                    processor::remove_background(&mut img, bg);
+                }
+
+                // Downscale (auto-detect per image)
+                if downscale_enabled {
+                    img = downscaler::auto_trim_image(&img);
+                    let grid_hint = downscaler::detect_grid_for_image(&img);
+                    let (scale, phase_x, phase_y) =
+                        downscaler::find_optimal_scale_for_image(&img, grid_hint);
+                    if scale > 1 {
+                        img = downscaler::downsample_image(&img, scale, phase_x, phase_y);
+                    }
+                }
+
+                // Post-processing
+                if let Some(ref alpha) = alpha_settings {
+                    processor::normalize_alpha(&mut img, alpha);
+                }
+                if let Some(ref merge) = merge_settings {
+                    processor::merge_colors(&mut img, merge);
+                }
+                if let Some(ref outline) = outline_settings {
+                    processor::add_outline(&mut img, outline);
+                }
+
+                processor::save_image(&img, &input)
+            })();
+
+            match result {
+                Ok(()) => {
+                    processed += 1;
+                    let _ = app.emit("batch-progress", BatchProgressEvent {
+                        index: i,
+                        total,
+                        current_file: file_path.clone(),
+                        status: "done".into(),
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    failed += 1;
+                    let _ = app.emit("batch-progress", BatchProgressEvent {
+                        index: i,
+                        total,
+                        current_file: file_path.clone(),
+                        status: "error".into(),
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+
+        // Write manifest so Revert All knows what to restore
+        if let Some(ref ws) = workspace_path {
+            write_batch_manifest(ws, &backup_manifest);
+        }
+
+        let _ = app.emit("batch-complete", BatchCompleteEvent {
+            processed,
+            failed,
+            cancelled: false,
+        });
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| error::PixelsError::Processing(format!("Task join error: {}", e)))?
+}
+
+#[tauri::command]
+async fn batch_cancel_command(app: AppHandle) -> Result<()> {
+    let cancel_flag = app.state::<Arc<AtomicBool>>();
+    cancel_flag.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+fn write_batch_manifest(workspace_path: &str, entries: &[(String, String)]) {
+    let manifest_path = PathBuf::from(workspace_path)
+        .join(".pixels")
+        .join("cache")
+        .join("batch_manifest.json");
+
+    let manifest: std::collections::HashMap<&str, &str> = entries
+        .iter()
+        .map(|(original, backup)| (original.as_str(), backup.as_str()))
+        .collect();
+
+    if let Ok(json) = serde_json::to_string_pretty(&manifest) {
+        let _ = std::fs::write(manifest_path, json);
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct BatchRevertResult {
+    reverted: usize,
+    failed: usize,
+    errors: Vec<String>,
+}
+
+/// Revert all images from the last batch operation using the manifest
+#[tauri::command]
+async fn batch_revert_command(workspace_path: String) -> Result<BatchRevertResult> {
+    let ws = workspace_path.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let cache_dir = PathBuf::from(&ws).join(".pixels").join("cache");
+        let manifest_path = cache_dir.join("batch_manifest.json");
+
+        if !manifest_path.exists() {
+            return Err(error::PixelsError::Processing(
+                "No batch manifest found. Nothing to revert.".into(),
+            ));
+        }
+
+        let manifest_content = std::fs::read_to_string(&manifest_path)?;
+        let manifest: std::collections::HashMap<String, String> =
+            serde_json::from_str(&manifest_content)?;
+
+        let mut reverted = 0usize;
+        let mut failed = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+
+        for (original_path, backup_name) in &manifest {
+            let backup_path = cache_dir.join(backup_name);
+
+            if !backup_path.exists() {
+                failed += 1;
+                errors.push(format!("Backup missing for {}", original_path));
+                continue;
+            }
+
+            match std::fs::copy(&backup_path, original_path) {
+                Ok(_) => reverted += 1,
+                Err(e) => {
+                    failed += 1;
+                    errors.push(format!("{}: {}", original_path, e));
+                }
+            }
+        }
+
+        // Remove manifest after revert (it's consumed)
+        let _ = std::fs::remove_file(&manifest_path);
+
+        Ok(BatchRevertResult { reverted, failed, errors })
+    })
+    .await
+    .map_err(|e| error::PixelsError::Processing(format!("Task join error: {}", e)))?
+}
+
+/// Check if a batch manifest exists (to show/hide the Revert button)
+#[tauri::command]
+async fn batch_has_manifest_command(workspace_path: String) -> Result<bool> {
+    let manifest_path = PathBuf::from(&workspace_path)
+        .join(".pixels")
+        .join("cache")
+        .join("batch_manifest.json");
+    Ok(manifest_path.exists())
+}
+
+// ============================================================================
 // WORKSPACE STATE COMMANDS
 // ============================================================================
 
@@ -527,6 +783,7 @@ pub fn run() {
             let database = Database::new(db_path).expect("Failed to initialize database");
 
             app.manage(Mutex::new(database));
+            app.manage(Arc::new(AtomicBool::new(false)));
 
             Ok(())
         })
@@ -545,6 +802,11 @@ pub fn run() {
             downscale_preview_command,
             generate_preview_command,
             process_and_save_command,
+            // Batch processing
+            batch_process_command,
+            batch_cancel_command,
+            batch_revert_command,
+            batch_has_manifest_command,
             // V2 workspace state
             init_workspace_command,
             load_workspace_command,
