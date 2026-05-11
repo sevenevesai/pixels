@@ -45,7 +45,7 @@ for file in "${TEMP_DIR}"/*; do
   name=$(basename "$file")
   case "$name" in
     # Updater bundles and signatures → updates/
-    *.tar.gz|*.tar.gz.sig|*.nsis.zip|*.nsis.zip.sig|*.msi.zip|*.msi.zip.sig|*.deb.sig|*.AppImage.sig)
+    *.tar.gz|*.tar.gz.sig|*.nsis.zip|*.nsis.zip.sig|*.msi.zip|*.msi.zip.sig|*.deb.sig|*.AppImage.sig|*.exe.sig|*.msi.sig)
       cp "$file" "${UPDATES_DIR}/"
       echo "  updates/  ${name}"
       ;;
@@ -71,31 +71,33 @@ echo ""
 echo "Rewriting latest.json URLs..."
 
 LATEST="${UPDATES_DIR}/latest.json"
+LATEST_WIN=$(cygpath -w "${LATEST}" 2>/dev/null || echo "${LATEST}")
 GITHUB_PREFIX="https://github.com/sevenevesai/pixels/releases/download/${TAG}/"
 
-python3 -c "
-import json, sys
+python -c "
+import json, sys, os
 
-with open('${LATEST}', 'r') as f:
+latest_path = sys.argv[1]
+github_prefix = sys.argv[2]
+site_base = sys.argv[3]
+
+with open(latest_path, 'r') as f:
     data = json.load(f)
-
-github_prefix = '${GITHUB_PREFIX}'
 
 for platform, info in data['platforms'].items():
     url = info['url']
     if not url.startswith(github_prefix):
         continue
     filename = url[len(github_prefix):]
-    # Updater bundles go to /updates/, plain installers to /downloads/
     if filename.endswith(('.tar.gz', '.nsis.zip', '.msi.zip')):
-        info['url'] = '${SITE_BASE}/updates/' + filename
+        info['url'] = site_base + '/updates/' + filename
     else:
-        info['url'] = '${SITE_BASE}/downloads/' + filename
+        info['url'] = site_base + '/downloads/' + filename
 
-with open('${LATEST}', 'w') as f:
+with open(latest_path, 'w') as f:
     json.dump(data, f, indent=2)
     f.write('\n')
-" || {
+" "${LATEST_WIN}" "${GITHUB_PREFIX}" "${SITE_BASE}" || {
   echo "ERROR: Failed to rewrite latest.json. Is python3 available?"
   exit 1
 }
