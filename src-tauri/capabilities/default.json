@@ -35,7 +35,9 @@
     },
     "fs:allow-create",
     "fs:allow-remove",
-    "fs:default"
+    "fs:default",
+    "updater:default",
+    "process:allow-restart"
   ],
   "platforms": ["windows", "linux", "macOS"]
 }

@@ -1,7 +1,7 @@
 {
   "name": "pixels-toolkit",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.2.1",
   "type": "module",
   "description": "Image processing and sprite sheet packing tool for pixel art",
   "author": "SeveNeves",
