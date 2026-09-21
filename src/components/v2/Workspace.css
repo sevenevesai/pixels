@@ -1564,6 +1564,49 @@
    ============================================================================ */
 
 /* Workspace V3 layout */
+.workspace-folder .workspace-path-bar {
+  flex-wrap: wrap;
+}
+
+.workspace-subfolders {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-left: auto;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.workspace-subfolders input {
+  accent-color: #667eea;
+}
+
+.workspace-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.6rem 1rem;
+  background: #44252d;
+  color: #ffb4b4;
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+
+.workspace-drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  border: 3px dashed #899bff;
+  background: rgba(22, 33, 62, 0.9);
+  color: #fff;
+  font-size: 1.3rem;
+}
+
 .workspace-main-v3 {
   display: flex;
   flex: 1;
@@ -1573,6 +1616,7 @@
 /* Folder navigation panel */
 .folder-nav {
   width: 200px;
+  flex-shrink: 0;
   background: #16213e;
   border-right: 1px solid #2d2d44;
   display: flex;
@@ -1625,6 +1669,11 @@
 .folder-nav-item.active {
   background: rgba(102, 126, 234, 0.2);
   color: #fff;
+}
+
+.folder-nav-item:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .nav-thumb {

@@ -1,7 +1,8 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { hexToRgba } from './types';
+import { relativeImagePath } from './folderImages';
 
 interface BulkProcessSettings {
   downscaleEnabled: boolean;
@@ -13,7 +14,6 @@ interface BulkProcessSettings {
   mergeEnabled: boolean;
   mergeThreshold: number;
   outlineEnabled: boolean;
-  outlineColor: string;
   outlineThickness: number;
 }
 
@@ -27,7 +27,6 @@ const DEFAULT_BULK_SETTINGS: BulkProcessSettings = {
   mergeEnabled: true,
   mergeThreshold: 3.0,
   outlineEnabled: true,
-  outlineColor: '#110602',
   outlineThickness: 1,
 };
 
@@ -50,9 +49,16 @@ interface BulkProcessPanelProps {
   workspacePath: string;
   onClose: () => void;
   onComplete: () => void;
+  includeSubfolders: boolean;
+  outlineColor: string;
+  onOutlineColorChange: (color: string) => void;
+  onBusyChange: (busy: boolean) => void;
 }
 
-export function BulkProcessPanel({ paths, workspacePath, onClose, onComplete }: BulkProcessPanelProps) {
+export function BulkProcessPanel({
+  paths, workspacePath, onClose, onComplete, includeSubfolders,
+  outlineColor, onOutlineColorChange, onBusyChange,
+}: BulkProcessPanelProps) {
   const [settings, setSettings] = useState<BulkProcessSettings>(DEFAULT_BULK_SETTINGS);
   const [isRunning, setIsRunning] = useState(false);
   const [progress, setProgress] = useState<{ index: number; total: number; currentFile: string } | null>(null);
@@ -62,6 +68,10 @@ export function BulkProcessPanel({ paths, workspacePath, onClose, onComplete }: 
   const [canRevert, setCanRevert] = useState(false);
   const [reverting, setReverting] = useState(false);
   const [revertResult, setRevertResult] = useState<{ reverted: number; failed: number } | null>(null);
+  const listenersReady = useRef<Promise<void>>(Promise.resolve());
+  const operationActive = useRef(false);
+  const batchStarted = useRef(false);
+  const cancelRequested = useRef(false);
 
   // Check if manifest exists on mount (in case panel was re-opened after a previous batch)
   useEffect(() => {
@@ -71,37 +81,50 @@ export function BulkProcessPanel({ paths, workspacePath, onClose, onComplete }: 
   }, [workspacePath]);
 
   useEffect(() => {
+    let disposed = false;
     const unlisteners: UnlistenFn[] = [];
+    const register = (promise: Promise<UnlistenFn>) => promise.then(unlisten => {
+      if (disposed) unlisten();
+      else unlisteners.push(unlisten);
+    });
 
-    listen<BatchProgressEvent>('batch-progress', (event) => {
-      const { index, total, current_file, status, error } = event.payload;
+    listenersReady.current = Promise.all([
+      register(listen<BatchProgressEvent>('batch-progress', (event) => {
+        if (disposed) return;
+        const { index, total, current_file, status, error } = event.payload;
 
-      if (status === 'processing') {
-        setProgress({ index, total, currentFile: current_file });
-      } else if (status === 'error' && error) {
-        setErrors(prev => [...prev, { file: current_file, error }]);
-      }
-    }).then(u => unlisteners.push(u));
+        if (status === 'processing') {
+          setProgress({ index, total, currentFile: current_file });
+        } else if (status === 'error' && error) {
+          setErrors(prev => [...prev, { file: current_file, error }]);
+        }
+      })),
 
-    listen<BatchCompleteEvent>('batch-complete', (event) => {
-      setIsRunning(false);
-      setResult(event.payload);
-      setProgress(null);
-      setCanRevert(true);
-      onComplete();
-    }).then(u => unlisteners.push(u));
+      register(listen<BatchCompleteEvent>('batch-complete', (event) => {
+        if (disposed) return;
+        setResult(event.payload);
+        setCanRevert(true);
+      })),
+    ]).then(() => {});
+    // handleStart also awaits this promise before allowing the backend to overwrite files.
+    void listenersReady.current.catch(err => console.error('Batch listeners unavailable:', err));
 
-    return () => { unlisteners.forEach(u => u()); };
-  }, [onComplete]);
+    return () => { disposed = true; unlisteners.forEach(u => u()); };
+  }, []);
 
   const handleStart = useCallback(async () => {
+    if (operationActive.current || paths.length === 0) return;
+    operationActive.current = true;
+    batchStarted.current = false;
+    cancelRequested.current = false;
+    onBusyChange(true);
     setIsRunning(true);
     setResult(null);
     setRevertResult(null);
     setErrors([]);
     setProgress({ index: 0, total: paths.length, currentFile: '' });
 
-    const [r, g, b, a] = hexToRgba(settings.outlineColor);
+    const [r, g, b, a] = hexToRgba(outlineColor);
 
     const backgroundSettings = settings.backgroundEnabled
       ? { tolerance: settings.backgroundTolerance }
@@ -120,6 +143,12 @@ export function BulkProcessPanel({ paths, workspacePath, onClose, onComplete }: 
       : null;
 
     try {
+      await listenersReady.current;
+      if (cancelRequested.current) {
+        setResult({ processed: 0, failed: 0, cancelled: true });
+        return;
+      }
+      batchStarted.current = true;
       await invoke('batch_process_command', {
         paths,
         workspacePath,
@@ -129,14 +158,23 @@ export function BulkProcessPanel({ paths, workspacePath, onClose, onComplete }: 
         mergeSettings,
         outlineSettings,
       });
+      onComplete();
     } catch (err) {
-      setIsRunning(false);
       setResult({ processed: 0, failed: paths.length, cancelled: false });
+      setErrors(prev => [...prev, { file: workspacePath, error: String(err) }]);
       console.error('Batch process failed:', err);
+    } finally {
+      operationActive.current = false;
+      batchStarted.current = false;
+      setIsRunning(false);
+      setProgress(null);
+      onBusyChange(false);
     }
-  }, [paths, workspacePath, settings]);
+  }, [paths, workspacePath, settings, outlineColor, onComplete, onBusyChange]);
 
   const handleCancel = useCallback(async () => {
+    cancelRequested.current = true;
+    if (!batchStarted.current) return;
     try {
       await invoke('batch_cancel_command');
     } catch (err) {
@@ -145,6 +183,9 @@ export function BulkProcessPanel({ paths, workspacePath, onClose, onComplete }: 
   }, []);
 
   const handleRevert = useCallback(async () => {
+    if (operationActive.current) return;
+    operationActive.current = true;
+    onBusyChange(true);
     setReverting(true);
     try {
       const result = await invoke<{ reverted: number; failed: number; errors: string[] }>(
@@ -159,16 +200,18 @@ export function BulkProcessPanel({ paths, workspacePath, onClose, onComplete }: 
       console.error('Revert failed:', err);
       setRevertResult({ reverted: 0, failed: 1 });
     } finally {
+      operationActive.current = false;
       setReverting(false);
+      onBusyChange(false);
     }
-  }, [workspacePath, onComplete]);
+  }, [workspacePath, onComplete, onBusyChange]);
 
   const updateSettings = useCallback((updates: Partial<BulkProcessSettings>) => {
     setSettings(prev => ({ ...prev, ...updates }));
   }, []);
 
   const progressPct = progress ? ((progress.index + 1) / progress.total * 100) : 0;
-  const currentFileName = progress?.currentFile.replace(/\\/g, '/').split('/').pop() || '';
+  const currentFileName = progress ? relativeImagePath(progress.currentFile, workspacePath) : '';
 
   return (
     <div className="bulk-panel">
@@ -180,7 +223,7 @@ export function BulkProcessPanel({ paths, workspacePath, onClose, onComplete }: 
               {reverting ? 'Reverting...' : 'Revert All'}
             </button>
           )}
-          <button className="btn-small" onClick={onClose} disabled={isRunning}>Close</button>
+          <button className="btn-small" onClick={onClose} disabled={isRunning || reverting}>Close</button>
         </div>
       </div>
 
@@ -285,8 +328,9 @@ export function BulkProcessPanel({ paths, workspacePath, onClose, onComplete }: 
                 <label>Color</label>
                 <input
                   type="color"
-                  value={settings.outlineColor}
-                  onChange={e => updateSettings({ outlineColor: e.target.value })}
+                  value={outlineColor}
+                  onChange={e => onOutlineColorChange(e.target.value)}
+                  aria-label="Outline color"
                 />
                 <label>Thickness</label>
                 <input
@@ -304,9 +348,12 @@ export function BulkProcessPanel({ paths, workspacePath, onClose, onComplete }: 
 
           <div className="bulk-summary">
             Applying to <strong>{paths.length}</strong> image{paths.length !== 1 ? 's' : ''}
+            <div className="bulk-hint">
+              {includeSubfolders ? 'This folder and all subfolders' : 'This folder only'}
+            </div>
           </div>
 
-          <button className="btn-primary bulk-start" onClick={handleStart}>
+          <button className="btn-primary bulk-start" onClick={handleStart} disabled={reverting || paths.length === 0}>
             Apply to All
           </button>
         </div>
@@ -327,7 +374,7 @@ export function BulkProcessPanel({ paths, workspacePath, onClose, onComplete }: 
         </div>
       )}
 
-      {result && (
+      {result && !isRunning && (
         <div className="bulk-panel-result">
           {result.cancelled ? (
             <div className="bulk-result-message">
@@ -352,7 +399,7 @@ export function BulkProcessPanel({ paths, workspacePath, onClose, onComplete }: 
                 <ul className="bulk-error-list">
                   {errors.map((e, i) => (
                     <li key={i}>
-                      <strong>{e.file.replace(/\\/g, '/').split('/').pop()}</strong>: {e.error}
+                      <strong>{relativeImagePath(e.file, workspacePath)}</strong>: {e.error}
                     </li>
                   ))}
                 </ul>
@@ -366,7 +413,7 @@ export function BulkProcessPanel({ paths, workspacePath, onClose, onComplete }: 
                 {reverting ? 'Reverting...' : 'Revert All'}
               </button>
             )}
-            <button className="btn" onClick={onClose}>Close</button>
+            <button className="btn" onClick={onClose} disabled={reverting}>Close</button>
           </div>
         </div>
       )}

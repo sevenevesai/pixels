@@ -1,13 +1,14 @@
 {
   "name": "pixels-toolkit",
   "private": true,
-  "version": "1.2.1",
+  "version": "1.3.0",
   "type": "module",
   "description": "Image processing and sprite sheet packing tool for pixel art",
   "author": "SeveNeves",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test": "playwright test",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -22,6 +23,7 @@
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@tauri-apps/cli": "^2.10.1",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",

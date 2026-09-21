@@ -3,7 +3,7 @@
 import { useState, useCallback, useEffect, useRef, WheelEvent, MouseEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
-import { ProcessingSettings, OutlineDetectionResult, ScaleDetectionResult, hexToRgba, rgbaToHex } from './types';
+import { DEFAULT_SETTINGS, ProcessingSettings, OutlineDetectionResult, ScaleDetectionResult, hexToRgba, rgbaToHex } from './types';
 
 // Zoom levels for pixel-perfect rendering
 const ZOOM_LEVELS = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16];
@@ -113,6 +113,8 @@ interface ImageEditorProps {
   onClose: () => void;
   /** Called when image is saved (to refresh thumbnail) */
   onSaved?: () => void;
+  outlineColor: string;
+  onOutlineColorChange: (color: string) => void;
 }
 
 interface DownscaleState {
@@ -127,23 +129,6 @@ interface DownscaleState {
   previewLoading: boolean;
 }
 
-const DEFAULT_SETTINGS: ProcessingSettings = {
-  downscaleEnabled: true,
-  downscaleAutoTrim: true,
-  downscaleTargetWidth: null,
-  downscaleTargetHeight: null,
-  backgroundEnabled: false,
-  backgroundTolerance: 30,
-  alphaEnabled: true,
-  alphaLowCutoff: 200,
-  alphaHighMin: 200,
-  mergeEnabled: true,
-  mergeThreshold: 3.0,
-  outlineEnabled: true,
-  outlineColor: '#110602',
-  outlineThickness: 1,
-};
-
 export function ImageEditor({
   imagePath,
   imageName,
@@ -152,6 +137,8 @@ export function ImageEditor({
   workspacePath,
   onClose,
   onSaved,
+  outlineColor,
+  onOutlineColorChange,
 }: ImageEditorProps) {
   // UI state
   const [zoom, setZoom] = useState(4);
@@ -177,7 +164,7 @@ export function ImageEditor({
   });
 
   // Post-process settings (Step 2)
-  const [settings, setSettings] = useState<ProcessingSettings>(DEFAULT_SETTINGS);
+  const [settings, setSettings] = useState<Omit<ProcessingSettings, 'outlineColor'>>(DEFAULT_SETTINGS);
 
   // Preview state
   const [previewData, setPreviewData] = useState<string | null>(null);
@@ -276,7 +263,7 @@ export function ImageEditor({
   const generatePreview = useCallback(async () => {
     setPreviewLoading(true);
     try {
-      const [r, g, b, a] = hexToRgba(settings.outlineColor);
+      const [r, g, b, a] = hexToRgba(outlineColor);
 
       const downscaleSettings = (isAiUpscaled && settings.downscaleEnabled) ? {
         enabled: true,
@@ -324,7 +311,7 @@ export function ImageEditor({
     } finally {
       setPreviewLoading(false);
     }
-  }, [imagePath, settings, isAiUpscaled, downscaleState]);
+  }, [imagePath, settings, outlineColor, isAiUpscaled, downscaleState]);
 
   // Trigger preview when settings change (only after downscale confirmed)
   useEffect(() => {
@@ -385,7 +372,7 @@ export function ImageEditor({
     setPreviewData(null);
   }, []);
 
-  const updateSettings = useCallback((updates: Partial<ProcessingSettings>) => {
+  const updateSettings = useCallback((updates: Partial<Omit<ProcessingSettings, 'outlineColor'>>) => {
     setSettings(prev => ({ ...prev, ...updates }));
   }, []);
 
@@ -429,7 +416,7 @@ export function ImageEditor({
 
       setStatusMessage('Processing...');
 
-      const [r, g, b, a] = hexToRgba(settings.outlineColor);
+      const [r, g, b, a] = hexToRgba(outlineColor);
 
       const downscaleSettings = (isAiUpscaled && settings.downscaleEnabled) ? {
         enabled: true,
@@ -513,7 +500,7 @@ export function ImageEditor({
     } finally {
       setIsProcessing(false);
     }
-  }, [imagePath, settings, isAiUpscaled, workspacePath, quickEdit, downscaleState.detectedScale, onSaved]);
+  }, [imagePath, settings, outlineColor, isAiUpscaled, workspacePath, quickEdit, downscaleState.detectedScale, onSaved]);
 
   // Render loading state - show original image with analysis overlay
   if (detectionLoading) {
@@ -824,8 +811,9 @@ export function ImageEditor({
                 <>
                   <input
                     type="color"
-                    value={settings.outlineColor}
-                    onChange={e => updateSettings({ outlineColor: e.target.value })}
+                    value={outlineColor}
+                    onChange={e => onOutlineColorChange(e.target.value)}
+                    aria-label="Outline color"
                   />
                   <div className="setting-control">
                     <input
