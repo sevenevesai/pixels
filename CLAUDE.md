@@ -30,7 +30,7 @@ npm run build          # TypeScript check + Vite build
    - LAB color clustering (merge similar colors)
    - Outline generation (frontier queue growing inward)
 
-4. **Sprite Packer** (`packer.rs`): Combines sprites into sheet (in progress)
+4. **Sprite Packer** (`packer.rs`): Combines sprites into sheet; only the V1 UI calls `pack_sprites_command`, so V3 has no sprite-sheet export
 
 5. **Auto-Updater** (`WorkspaceV3.tsx`): Checks for updates on launch, shows banner with install/dismiss
 
@@ -54,7 +54,7 @@ npm run build          # TypeScript check + Vite build
 - `src/components/v2/Workspace.css` - All styles
 
 **Legacy UIs** (can switch via `UI_VERSION` in App.tsx):
-- V1: Tab-based (DownscaleTab, ProcessTab, PackTab)
+- V1: Tab-based (`AppV1`, inline in App.tsx: downscale, process, pack tabs)
 - V2: Batch/samples UI (complex, deprecated)
 
 ### Key Tauri Commands
@@ -131,7 +131,7 @@ Background removal runs BEFORE downscale to prevent background color bleeding in
 - Harmonic Product Spectrum: aggregates FFT power across harmonics of each candidate period
 - Autocorrelation reinforcement as secondary signal
 - Divisor preference: among candidates >80% of max score, picks smallest (fundamental)
-- Scale range: 4-20px
+- Scale range: 3-20px (`min_scale`/`max_scale` in `find_optimal_scale_v4_with_results`)
 - Phase search via block variance minimization (coarse + fine)
 - Manual override: `downscale_to_dimensions()` for exact target dimensions
 
@@ -206,8 +206,6 @@ Background removal runs BEFORE downscale to prevent background color bleeding in
 
 ### Not Yet Implemented
 - Full lineage/version history tracking (backend infrastructure exists, UI not connected)
-- Bulk operations (deferred intentionally)
-- Drag-and-drop file opening
 - Manual background color picker (override auto-detection)
 
 ### Key Files Modified (Mar 2026 Session)
