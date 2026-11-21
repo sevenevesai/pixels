@@ -95,6 +95,7 @@ The V3 UI treats the app as an **image editor** (not a pipeline/export tool):
 - Folder mode: Left panel thumbnails + right editor area
 - Thumbnails load progressively (no blocking)
 - `UpdateBanner` component: checks for updates 2s after launch, shows green banner
+- `DiscordNudge.tsx`: header link `Discord community` plus a one-time bottom-right card (`shouldShowNudge` holds the rule). Settings keys `launch_count`, `discord_nudge_seen` in `app_settings`; URLs are `https://seveneves.ai/discord/?from=pixels-app|pixels-nudge`; opener permission is scoped to `https://seveneves.ai/discord/*`
 
 **ImageEditor** (`ImageEditor.tsx`):
 - Detects AI upscale on open (not pre-loaded)

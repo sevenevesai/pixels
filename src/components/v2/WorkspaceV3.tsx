@@ -14,6 +14,7 @@ import { ImageEditor } from './ImageEditor';
 import { BulkProcessPanel } from './BulkProcessPanel';
 import { FolderImage, IMAGE_EXTENSIONS, isImagePath, scanFolderImages } from './folderImages';
 import { useOutlineColor } from './useOutlineColor';
+import { DISCORD_APP_URL, DiscordNudge, openDiscord } from './DiscordNudge';
 import './Workspace.css';
 
 // Update checker banner — checks on mount, shows banner if update available
@@ -98,6 +99,8 @@ export function WorkspaceV3() {
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [bulkBusy, setBulkBusy] = useState(false);
+  const [editorBusy, setEditorBusy] = useState(false);
+  const [actionDone, setActionDone] = useState(false);
   const busyRef = useRef(false);
   const openRequest = useRef(0);
   const folderRequest = useRef(0);
@@ -283,7 +286,16 @@ export function WorkspaceV3() {
           <button onClick={openFolder} className="btn" disabled={bulkBusy}>Open Folder</button>
           <button onClick={openImage} className="btn" disabled={bulkBusy}>Open Image</button>
         </div>
+        <a
+          className="workspace-community-link"
+          href={DISCORD_APP_URL}
+          title="Join the seveneves Discord"
+          onClick={e => { e.preventDefault(); openDiscord(DISCORD_APP_URL); }}
+        >
+          Discord community
+        </a>
       </header>
+      <DiscordNudge busy={bulkBusy || editorBusy} actionDone={actionDone} />
 
       {state.mode === null ? (
         <div className="workspace-empty">
@@ -306,6 +318,8 @@ export function WorkspaceV3() {
           onClose={closeWorkspace}
           outlineColor={outlineColor}
           onOutlineColorChange={setOutlineColor}
+          onBusyChange={setEditorBusy}
+          onSaved={() => setActionDone(true)}
         />
       ) : folderPath ? (
         <>
@@ -388,6 +402,7 @@ export function WorkspaceV3() {
                   onComplete={() => {
                     // Refresh all thumbnails after bulk processing
                     void loadFolder(folderPath, includeSubfolders);
+                    setActionDone(true);
                   }}
                 />
               ) : state.currentImage ? (
@@ -401,7 +416,9 @@ export function WorkspaceV3() {
                   onClose={closeEditor}
                   outlineColor={outlineColor}
                   onOutlineColorChange={setOutlineColor}
+                  onBusyChange={setEditorBusy}
                   onSaved={() => {
+                    setActionDone(true);
                     // Refresh thumbnail after save
                     if (state.currentImage) {
                       refreshThumbnail(state.currentImage.path, folderPath, setState);

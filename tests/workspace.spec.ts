@@ -188,3 +188,76 @@ test('invalid saved colors fall back to the default and failed saves are visible
   await expect(page.getByLabel('Outline color')).toHaveValue('#112233');
   await expect(page.getByRole('alert')).toContainText('Could not remember the outline color');
 });
+
+const NUDGE_TEXT = 'Found a bug or want a feature? Tell me on Discord.';
+const launchCount = (page: Page) => page.evaluate(() => localStorage.getItem('launch_count'));
+const openedUrls = (page: Page) => page.evaluate(() => window.nativeMock.calls
+  .filter(c => c.command === 'plugin:opener|open_url').map(c => c.args.url));
+
+test('the permanent Discord community link opens the app redirect', async ({ page }) => {
+  await mockTauri(page);
+  const link = page.getByRole('link', { name: 'Discord community', exact: true });
+  await expect(link).toBeVisible();
+  await link.click();
+  expect(await openedUrls(page)).toEqual(['https://seveneves.ai/discord/?from=pixels-app']);
+});
+
+test('the Discord nudge stays hidden on launches 1 and 2, then appears once on launch 3 and never returns', async ({ page }) => {
+  await mockTauri(page);
+  await expect.poll(() => launchCount(page)).toBe('1');
+  await page.waitForTimeout(3600);
+  await expect(page.getByText(NUDGE_TEXT)).toHaveCount(0);
+
+  await page.reload();
+  await expect.poll(() => launchCount(page)).toBe('2');
+  await page.waitForTimeout(3600);
+  await expect(page.getByText(NUDGE_TEXT)).toHaveCount(0);
+
+  await page.reload();
+  await expect.poll(() => launchCount(page)).toBe('3');
+  await expect(page.getByText(NUDGE_TEXT)).toBeVisible({ timeout: 6000 });
+  expect(await page.evaluate(() => localStorage.getItem('discord_nudge_seen'))).toBe('1');
+  await expect(page.getByRole('button', { name: 'Join', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Close', exact: true })).toBeVisible();
+  // It hides by itself.
+  await expect(page.getByText(NUDGE_TEXT)).toHaveCount(0, { timeout: 14000 });
+  expect(await openedUrls(page)).toEqual([]);
+
+  await page.reload();
+  await expect.poll(() => launchCount(page)).toBe('4');
+  await page.waitForTimeout(3600);
+  await expect(page.getByText(NUDGE_TEXT)).toHaveCount(0);
+});
+
+test('Join opens the nudge redirect and closing the card keeps it from returning', async ({ page }) => {
+  await mockTauri(page, { settings: { launch_count: '2' } });
+  await expect(page.getByText(NUDGE_TEXT)).toBeVisible({ timeout: 6000 });
+  await page.getByRole('button', { name: 'Join', exact: true }).click();
+  await expect(page.getByText(NUDGE_TEXT)).toHaveCount(0);
+  expect(await openedUrls(page)).toEqual(['https://seveneves.ai/discord/?from=pixels-nudge']);
+  await page.reload();
+  await page.waitForTimeout(3600);
+  await expect(page.getByText(NUDGE_TEXT)).toHaveCount(0);
+});
+
+test('closing the Discord nudge hides it without opening anything', async ({ page }) => {
+  await mockTauri(page, { settings: { launch_count: '2' } });
+  await expect(page.getByText(NUDGE_TEXT)).toBeVisible({ timeout: 6000 });
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+  await expect(page.getByText(NUDGE_TEXT)).toHaveCount(0);
+  expect(await openedUrls(page)).toEqual([]);
+  expect(await page.evaluate(() => localStorage.getItem('discord_nudge_seen'))).toBe('1');
+});
+
+test('the Discord nudge fails closed when settings cannot be read or written', async ({ page }) => {
+  await mockTauri(page, { settings: { launch_count: '5' }, failSettingsRead: true });
+  await page.waitForTimeout(3600);
+  await expect(page.getByText(NUDGE_TEXT)).toHaveCount(0);
+  await expect(page.getByRole('link', { name: 'Discord community', exact: true })).toBeVisible();
+});
+
+test('the Discord nudge is not shown when its seen flag cannot be saved', async ({ page }) => {
+  await mockTauri(page, { settings: { launch_count: '5' }, failSave: true });
+  await page.waitForTimeout(3600);
+  await expect(page.getByText(NUDGE_TEXT)).toHaveCount(0);
+});

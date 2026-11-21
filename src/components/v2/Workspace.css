@@ -68,6 +68,50 @@
   gap: 0.5rem;
 }
 
+.workspace-community-link {
+  margin-left: auto;
+  font-size: 0.8rem;
+  color: #8b8ba7;
+  text-decoration: none;
+}
+
+.workspace-community-link:hover,
+.workspace-community-link:focus-visible {
+  color: #c4c4d8;
+  text-decoration: underline;
+}
+
+.discord-nudge {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  max-width: 22rem;
+  padding: 0.6rem 0.75rem;
+  background: #1a1a2e;
+  border: 1px solid #2d2d44;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  color: #c4c4d8;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+.discord-nudge button {
+  padding: 0.2rem 0.6rem;
+  background: transparent;
+  border: 1px solid #2d2d44;
+  border-radius: 4px;
+  color: inherit;
+  cursor: pointer;
+}
+
+.discord-nudge button:hover {
+  border-color: #8b8ba7;
+}
+
 /* Workspace Path Bar */
 .workspace-path-bar {
   display: flex;

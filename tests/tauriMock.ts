@@ -16,6 +16,8 @@ interface MockOptions {
   failSave?: boolean;
   listenerDelay?: number;
   batchListenerDelay?: number;
+  settings?: Record<string, string>;
+  failSettingsRead?: boolean;
 }
 
 interface NativeMock {
@@ -69,6 +71,9 @@ export async function mockTauri(page: Page, options: MockOptions = {}) {
       listenerCount: event => [...listeners.values()].filter(l => l.event === event).length,
     };
     window.nativeMock = mock;
+    for (const [key, value] of Object.entries(options.settings ?? {})) {
+      if (localStorage.getItem(key) === null) localStorage.setItem(key, value);
+    }
     if (options.savedColor && !localStorage.getItem('outline_color')) {
       localStorage.setItem('outline_color', options.savedColor);
     }
@@ -109,6 +114,7 @@ export async function mockTauri(page: Page, options: MockOptions = {}) {
               await pause(options.thumbnailDelay);
               return png;
             case 'get_app_setting': {
+              if (options.failSettingsRead) throw new Error('Settings unavailable');
               const value = localStorage.getItem(args.key);
               await pause(options.settingDelay);
               return value;
@@ -136,6 +142,7 @@ export async function mockTauri(page: Page, options: MockOptions = {}) {
             case 'batch_cancel_command': return mock.finishBatch(true);
             case 'batch_revert_command': return { reverted: 4, failed: 0, errors: [] };
             case 'plugin:updater|check': return null;
+            case 'plugin:opener|open_url': return;
             default: throw new Error(`Unexpected command: ${command}`);
           }
         },

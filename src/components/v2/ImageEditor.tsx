@@ -113,6 +113,8 @@ interface ImageEditorProps {
   onClose: () => void;
   /** Called when image is saved (to refresh thumbnail) */
   onSaved?: () => void;
+  /** Reports whether a save is in progress */
+  onBusyChange?: (busy: boolean) => void;
   outlineColor: string;
   onOutlineColorChange: (color: string) => void;
 }
@@ -137,6 +139,7 @@ export function ImageEditor({
   workspacePath,
   onClose,
   onSaved,
+  onBusyChange,
   outlineColor,
   onOutlineColorChange,
 }: ImageEditorProps) {
@@ -144,6 +147,10 @@ export function ImageEditor({
   const [zoom, setZoom] = useState(4);
   const [showGrid, setShowGrid] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  useEffect(() => {
+    onBusyChange?.(isProcessing);
+    return () => onBusyChange?.(false);
+  }, [isProcessing, onBusyChange]);
   const [statusMessage, setStatusMessage] = useState('');
 
   // Detection state
