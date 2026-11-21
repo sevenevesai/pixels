@@ -17,7 +17,8 @@ a whole folder.
 [**Download**](https://github.com/sevenevesai/pixels/releases/latest) ·
 [Website](https://seveneves.ai/pixels/) ·
 [For AI agents](#for-ai-agents) ·
-[Report a bug](https://github.com/sevenevesai/pixels/issues/new)
+[Report a bug](https://github.com/sevenevesai/pixels/issues/new) ·
+[Discord](https://seveneves.ai/discord/?from=pixels-readme)
 
 </div>
 
@@ -199,6 +200,8 @@ CLAUDE.md            notes for AI coding agents
 ```
 
 ## Contributing
+
+Questions and feature requests: [Discord](https://seveneves.ai/discord/?from=pixels-readme). Bugs: [open an issue](https://github.com/sevenevesai/pixels/issues/new).
 
 Report bugs and ideas in [Issues](https://github.com/sevenevesai/pixels/issues). CI runs only on
 version tags, not on pull requests, so run the tests above and `npm run build` before sending one.
